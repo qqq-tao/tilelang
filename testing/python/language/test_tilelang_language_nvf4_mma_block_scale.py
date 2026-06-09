@@ -5,7 +5,7 @@ import tilelang.language as T
 import tilelang.testing
 from tilelang import tvm
 from tilelang.cuda.intrinsics.layout.mma_layout import mma_load_a_32x32_to_shared_16x64_layout
-from tilelang.intrinsics import BlockScaleTensorCoreIntrinEmitter, get_swizzle_layout
+from tilelang.intrinsics import TensorCoreIntrinEmitterWithBlockScale, get_swizzle_layout
 from tilelang.transform import simplify_prim_func
 
 
@@ -89,7 +89,7 @@ def _make_nvf4_matmul_codegen_kernel(M, N, K):
     warp_rows = warp_row_tiles // micro_size_x
     warp_cols = warp_col_tiles // micro_size_y
 
-    mma_emitter = BlockScaleTensorCoreIntrinEmitter(
+    mma_emitter = TensorCoreIntrinEmitterWithBlockScale(
         a_dtype=in_dtype,
         b_dtype=in_dtype,
         accum_dtype=accum_dtype,
@@ -240,8 +240,8 @@ def test_nvf4_mma_block_scale_fragment_layouts_match_cute():
 
 
 def test_nvf4_mma_block_scale_lane_scale_mapping_matches_cute():
-    sfa_rows = [BlockScaleTensorCoreIntrinEmitter._sfa_row_in_atom(tx) for tx in range(32)]
-    sfb_cols = [BlockScaleTensorCoreIntrinEmitter._sfb_col_in_atom(tx) for tx in range(32)]
+    sfa_rows = [TensorCoreIntrinEmitterWithBlockScale._sfa_row_in_atom(tx) for tx in range(32)]
+    sfb_cols = [TensorCoreIntrinEmitterWithBlockScale._sfb_col_in_atom(tx) for tx in range(32)]
 
     assert sfa_rows == [
         0,
@@ -323,7 +323,7 @@ def test_nvf4_mma_block_scale_lane_scale_mapping_matches_cute():
 )
 def test_nvf4_mma_block_scale_rejects_unsupported_configs(kwargs):
     with pytest.raises(ValueError, match="Unsupported SM120 block-scale MMA config"):
-        BlockScaleTensorCoreIntrinEmitter(
+        TensorCoreIntrinEmitterWithBlockScale(
             a_dtype=T.float4_e2m1fn,
             b_dtype=T.float4_e2m1fn,
             accum_dtype=T.float32,

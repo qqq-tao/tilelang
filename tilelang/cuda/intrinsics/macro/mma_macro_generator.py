@@ -1271,7 +1271,7 @@ class TensorCoreIntrinEmitterWithLadderTransform(TensorCoreIntrinEmitter):
 
         return _warp_mma(A_local_buf, B_local_buf, C_local_buf)
 
-class BlockScaleTensorCoreIntrinEmitter(TensorCoreIntrinEmitter):
+class TensorCoreIntrinEmitterWithBlockScale(TensorCoreIntrinEmitter):
     """SM120 warp-level block-scale MMA emitter.
 
     The emitter keeps scale-factor storage explicit, matching TileLang's
@@ -1547,6 +1547,3 @@ class BlockScaleTensorCoreIntrinEmitter(TensorCoreIntrinEmitter):
 
         return _warp_mma_block_scale(A_local_buf, B_local_buf, C_local_buf, SFA_data, SFB_data, thread_binding)
 
-
-class NVF4TensorCoreIntrinEmitter(BlockScaleTensorCoreIntrinEmitter):
-    """Compatibility wrapper for SM120 NVF4 block-scaled MMA."""
