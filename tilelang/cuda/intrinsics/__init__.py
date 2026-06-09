@@ -7,6 +7,8 @@ from .layout.utils import (  # noqa: F401
 from .macro.mma_macro_generator import (  # noqa: F401
     TensorCoreIntrinEmitter,
     TensorCoreIntrinEmitterWithLadderTransform,
+    BlockScaleTensorCoreIntrinEmitter,
+    NVF4TensorCoreIntrinEmitter,
 )
 
 from .layout.mma_layout import get_swizzle_layout  # noqa: F401
