@@ -214,7 +214,7 @@ def _emit(op, ctx):
 def rf_ws_gemm(M, N, K, schedule=None, block_M=128, block_N=128, block_K=256,
                num_stages=2, out_dtype=T.bfloat16, use_emitter=False,
                persistent=True, group_m=8, _skip_epilogue=False,
-               async_epilogue=False, panel_M=None):
+               async_epilogue=False, panel_M=None, swizzle_cshared=True):
     # panel_M=None stages the whole tile: slicing an mma store-layout
     # fragment by rows yields a layout the normaliser rejects.
     if panel_M is None:
@@ -299,6 +299,10 @@ def rf_ws_gemm(M, N, K, schedule=None, block_M=128, block_N=128, block_K=256,
             # do, and the store is issued per panel.
             if async_epilogue:
                 C_shared = T.alloc_shared((panel_M, block_N), out_dtype)
+                # The fragment-to-shared copy walks the mma store layout, so the
+                # destination decides whether that scatter hits bank conflicts.
+                if swizzle_cshared:
+                    T.annotate_layout({C_shared: make_swizzled_layout(C_shared)})
 
             T.annotate_layout({
                 A_shared: make_swizzled_layout(A_shared),

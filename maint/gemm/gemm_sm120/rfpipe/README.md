@@ -128,11 +128,28 @@ is neither bandwidth nor the fp32-to-bf16 conversion -- it is the **access
 pattern**. `make_mma_store_layout` leaves each thread holding elements scattered
 across the tile, and walking that layout to a row-major destination is the cost.
 
-That also explains why staging through shared memory bought only 2%: the scatter
-moves from global to shared, it does not disappear. The fix has to change the
-pattern, not the destination -- rearrange within the warp before storing, or
-store through an epilogue tiling that is already coalesced, which is what
-CUTLASS's `epi_tile 64x32` is for.
+Every cheap explanation is now eliminated, each by measurement:
+
+| hypothesis | test | result |
+|---|---|---|
+| bandwidth | fp32 output, twice the bytes | -1.8% |
+| fp32→bf16 conversion | same | -1.8% |
+| global write latency | asynchronous TMA store | +2.0% |
+| shared bank conflicts | swizzled `C_shared` | +0.0% |
+| rasterisation | group_m 1..32 | flat |
+
+So the epilogue is simply work: 128 accumulators per thread to convert and
+store, and no restructuring of the destination removes it. The only way to pay
+less for it is to overlap it with another warpgroup's MMAs -- warpgroup
+pingpong -- which currently loses more than it saves because every tile handover
+waits for a pipeline fill.
+
+**A3 therefore reduces to one thing: make the tile handover in
+`wg_pingpong.py` not stall.** The two consumers share one stage set, so the
+producer can never be more than one stage ahead of whichever consumer it is
+feeding. Giving each consumer its own stage set, or a deeper pipeline, is what
+would let the incoming warpgroup start immediately -- and at block_K=128 the
+shared budget allows 2 sets x 2 stages (73728 B), which block_K=256 does not.
 
 ### Constraints found the hard way
 
