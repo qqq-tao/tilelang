@@ -98,23 +98,29 @@ PINGPONG_4 = (
 
 @T.macro
 def _emit_cp(pkg, A_shared, B_shared, kblock):
-    T.call_extern("handle", "tl_rf_copy_ab", pkg.data, A_shared.data, B_shared.data, kblock)
+    # access_ptr, not .data: it carries buffer identity and the access mask, so
+    # the pipeline pass can see that this consumes A/B and build the dependency.
+    T.call_extern("handle", "tl_rf_copy_ab", T.access_ptr(pkg, "w"),
+                  T.access_ptr(A_shared, "r"), T.access_ptr(B_shared, "r"), kblock)
 
 
 @T.macro
 def _emit_sf(spkg, SFA_shared, SFB_shared, kblock):
-    T.call_extern("handle", "tl_rf_copy_sf", spkg.data, SFA_shared.data, SFB_shared.data, kblock)
+    T.call_extern("handle", "tl_rf_copy_sf", T.access_ptr(spkg, "w"),
+                  T.access_ptr(SFA_shared, "r"), T.access_ptr(SFB_shared, "r"), kblock)
 
 
 @T.macro
 def _emit_full(C_local, A_shared, B_shared, SFA_shared, SFB_shared):
-    T.call_extern("handle", "tl_rf_full", C_local.data, A_shared.data, B_shared.data,
-                  SFA_shared.data, SFB_shared.data)
+    T.call_extern("handle", "tl_rf_full", T.access_ptr(C_local, "w"),
+                  T.access_ptr(A_shared, "r"), T.access_ptr(B_shared, "r"),
+                  T.access_ptr(SFA_shared, "r"), T.access_ptr(SFB_shared, "r"))
 
 
 @T.macro
 def _emit_mma(C_local, pkg, spkg):
-    T.call_extern("handle", "tl_rf_gemm", C_local.data, pkg.data, spkg.data)
+    T.call_extern("handle", "tl_rf_gemm", T.access_ptr(C_local, "w"),
+                  T.access_ptr(pkg, "r"), T.access_ptr(spkg, "r"))
 
 
 @tilelang.jit(out_idx=None)
@@ -163,7 +169,14 @@ def rf_sched_gemm(M, N, K, schedule, block_M=128, block_N=128, block_K=256,
             T.import_source(_WRAPPERS)
 
             T.clear(C_local)
-            for ko in T.Pipelined(K // block_K, num_stages=num_stages):
+            # T.serial, not T.Pipelined: the warp-specialization pass assigns
+            # the schedule calls to the consumer branch but does not recognise
+            # an opaque extern as the producer of C_local, so the epilogue (and
+            # T.clear, and the C parameter itself) get eliminated. Correctness
+            # first here; recovering the pipeline requires the primitives to
+            # carry access semantics the pass understands, which is the
+            # "fold into the emitter" step of the roadmap.
+            for ko in T.serial(K // block_K):
                 T.copy(A[by * block_M, ko * block_K], A_shared,
                        annotations={"prefer_instruction": "tma"})
                 T.copy(B[bx * block_N, ko * block_K], B_shared,
