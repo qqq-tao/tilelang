@@ -71,7 +71,8 @@ store_layout = _v3.store_layout
 
 @tilelang.jit(out_idx=None)
 def wg_pingpong_gemm(M, N, K, schedule=None, block_M=128, block_N=128, block_K=256,
-                     num_stages=2, out_dtype=T.bfloat16, group_m=1, order=True,
+                     num_stages=2, out_dtype=T.bfloat16, producer_regs=40,
+              consumer_regs=224, group_m=1, order=True,
                      split_stages=False):
     # order=False is not a valid configuration, only a way to measure the
     # barriers' cost: the producer fills stages in one global order, so the two
@@ -171,6 +172,12 @@ def wg_pingpong_gemm(M, N, K, schedule=None, block_M=128, block_N=128, block_K=2
                     (pkg0, pkg1), (sp0, sp1), loaded, consumed)
 
             if tx >= 256:
+                # At 384 threads the register file caps every thread at
+                # 65536/384 = 170, but the kernel wants 218, so a uniform cap
+                # spills. Splitting it asymmetrically -- the producer only
+                # addresses TMA descriptors -- fits: 128*40 + 256*224 = 62464.
+                if producer_regs > 0:
+                    T.set_max_nreg(producer_regs, 0)
                 # Producer: streams both consumers' tiles, in the order they
                 # will be consumed, on one pipeline.
                 for rnd in T.serial(rounds):
@@ -207,6 +214,8 @@ def wg_pingpong_gemm(M, N, K, schedule=None, block_M=128, block_N=128, block_K=2
                                        SFB_shared[stage, :, :])
                                 T.barrier_arrive(loaded[stage])
             elif tx < 128:
+                if consumer_regs > 0:
+                    T.set_max_nreg(consumer_regs, 1)
                 # Consumer 0: even tiles. Starts un-blocked.
                 C0 = T.alloc_fragment((block_M, block_N), accum_dtype)
                 T.annotate_layout({C0: store_layout(emitter, C0, 0)})
@@ -233,6 +242,8 @@ def wg_pingpong_gemm(M, N, K, schedule=None, block_M=128, block_N=128, block_K=2
             else:
                 # Consumer 1: odd tiles. Its MMAs are released by consumer 0's
                 # arrive, so its epilogue lands under consumer 0's next MMAs.
+                if consumer_regs > 0:
+                    T.set_max_nreg(consumer_regs, 1)
                 C1 = T.alloc_fragment((block_M, block_N), accum_dtype)
                 T.annotate_layout({C1: store_layout(emitter, C1, 128)})
                 for rnd in T.serial(rounds):

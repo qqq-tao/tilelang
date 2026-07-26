@@ -109,7 +109,8 @@ _emit = sched_gemm._emit
 
 @tilelang.jit(out_idx=None)
 def coop_gemm(M, N, K, schedule=None, block_M=256, block_N=128, block_K=128,
-              num_stages=3, out_dtype=T.bfloat16, persistent=True, group_m=8):
+              num_stages=3, out_dtype=T.bfloat16, producer_regs=40,
+              consumer_regs=224, persistent=True, group_m=8):
     assert M % block_M == 0 and N % block_N == 0 and K % block_K == 0
     assert block_M == 256, "this kernel is the two-consumer-warpgroup M split"
     in_dtype = T.float4_e2m1fn
@@ -206,6 +207,12 @@ def coop_gemm(M, N, K, schedule=None, block_M=256, block_N=128, block_K=128,
             tx = T.get_thread_binding()
 
             if tx >= 256:
+                # At 384 threads the register file caps every thread at
+                # 65536/384 = 170, but the kernel wants 218, so a uniform cap
+                # spills. Splitting it asymmetrically -- the producer only
+                # addresses TMA descriptors -- fits: 128*40 + 256*224 = 62464.
+                if producer_regs > 0:
+                    T.set_max_nreg(producer_regs, 0)
                 for stream in T.serial(tile_iters):
                     tile_id = block_id + stream * tile_stride
                     if tile_id < total_tiles:
@@ -242,6 +249,8 @@ def coop_gemm(M, N, K, schedule=None, block_M=256, block_N=128, block_K=128,
                                    SFB_shared[stage, :, :])
                             T.barrier_arrive(loaded[stage])
             elif tx < 128:
+                if consumer_regs > 0:
+                    T.set_max_nreg(consumer_regs, 1)
                 C0_local = T.alloc_fragment((half_M, block_N), accum_dtype)
                 T.annotate_layout({C0_local: store_layout(emitter, C0_local, 0)})
                 for stream in T.serial(tile_iters):

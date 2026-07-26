@@ -144,13 +144,35 @@ less for it is to overlap it with another warpgroup's MMAs -- warpgroup
 pingpong -- which currently loses more than it saves because every tile handover
 waits for a pipeline fill.
 
-Tried that too. Giving each consumer its own stage set (`split_stages`, two sets
-of two at block_K=128, 73728 B) is bitwise correct and worth **+4%**: 599.9
-against 575.9 at 4096³, still 44% below the single-consumer kernel's 1064.6. So
-the handover fill was not the dominant cost of warpgroup pingpong either, and
-**A3 has no open lead left**. Whatever makes the two-consumer structure lose
-half its throughput here is not the stage supply, and finding it needs a
-profiler rather than another structural variant.
+Giving each consumer its own stage set (`split_stages`, two sets of two at
+block_K=128) is bitwise correct and worth only +4%, so the handover fill was not
+it either.
+
+**It was register spilling.** `ptxas -v` on the three kernels:
+
+| kernel | threads | registers/thread | spill |
+|---|---|---|---|
+| single consumer | 256 | **218** | **0** |
+| warpgroup pingpong | 384 | 168 (capped) | 592 st / 624 ld |
+| Mt=256 cooperative | 384 | 168 (capped) | 284 st / 264 ld |
+
+65536 registers per SM over 384 threads caps every thread at 170, and the kernel
+wants 218, so both 384-thread kernels were spilling to local memory the whole
+time. The production kernel avoids this with an asymmetric split -- the producer
+only addresses TMA descriptors -- and neither rfpipe kernel was calling
+`T.set_max_nreg` at all.
+
+With `producer_regs=40, consumer_regs=224` (128x40 + 256x224 = 62464):
+
+| | before | after |
+|---|---|---|
+| pingpong spill | 592 / 624 B | **0 / 0** |
+| pingpong 4096³ | 575.9 | **881.7** (+53%) |
+| pingpong 8192³ | 651.2 | **1154.1** (+77%) |
+
+Still under the single-consumer kernel (1062.2 / 1232.9), but the structure is
+viable now rather than hopeless, and the quota split is itself a schedule
+parameter.
 
 ### Constraints found the hard way
 
