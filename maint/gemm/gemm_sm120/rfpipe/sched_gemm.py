@@ -64,6 +64,7 @@ import tilelang
 import tilelang.language as T
 from tilelang.intrinsics import TensorCoreIntrinEmitter
 from tilelang.layout import make_swizzled_layout
+from tilelang.carver.arch import driver
 from tilelang.profiler import do_bench
 from tilelang.quantize import swizzle_blockscaled_chunk_kmajor_scale_words
 
@@ -200,7 +201,8 @@ def _emit(op, ctx):
 
 @tilelang.jit(out_idx=None)
 def rf_ws_gemm(M, N, K, schedule=None, block_M=128, block_N=128, block_K=256,
-               num_stages=2, out_dtype=T.bfloat16, use_emitter=False):
+               num_stages=2, out_dtype=T.bfloat16, use_emitter=False,
+               persistent=True, group_m=8):
     """use_emitter swaps the schedule for T.mma_gemm_blockscaled in the same
     kernel skeleton, so the two can be compared with only the inner loop
     differing. At block_K=256 the emitter routes to the package pingpong; at 128
@@ -220,6 +222,17 @@ def rf_ws_gemm(M, N, K, schedule=None, block_M=128, block_N=128, block_K=256,
     sfb_stage_bytes = block_N * wpk * 4
     scale_tile_words = block_M * wpk
 
+    # One CTA per SM, streaming over tiles. At 4096^3 this tile is 1024 tiles
+    # over 170 SMs -- 6.02 waves, so a 7-wave runtime for 6.02 waves of work
+    # loses 14%, which is most of the gap against the vendor at that shape.
+    sm_num = driver.get_num_sms()
+    n_blocks = N // block_N
+    m_blocks = M // block_M
+    total_tiles = n_blocks * m_blocks
+    grid = sm_num if persistent else total_tiles
+    tile_stride = sm_num if persistent else total_tiles
+    tile_iters = ((total_tiles + sm_num - 1) // sm_num) if persistent else 1
+
     emitter = TensorCoreIntrinEmitter(
         a_dtype=in_dtype, b_dtype=in_dtype, accum_dtype=accum_dtype,
         a_transposed=False, b_transposed=True,
@@ -227,6 +240,18 @@ def rf_ws_gemm(M, N, K, schedule=None, block_M=128, block_N=128, block_K=256,
         warp_row_tiles=64, warp_col_tiles=64, chunk=block_K,
         is_blockscaled=True, kind="mxf4nvf4", scale_vec_size=4, stype="ue4m3",
     )
+
+    def tile_coords(tile_id):
+        """Grouped-M rasterisation: sweep N inside a band of group_m tile rows,
+        so a band of A stays resident instead of being evicted every sweep."""
+        if group_m <= 1:
+            return tile_id % n_blocks, tile_id // n_blocks
+        per_group = group_m * n_blocks
+        group = tile_id // per_group
+        first_m = group * group_m
+        rows = T.min(group_m, m_blocks - first_m)
+        within = tile_id % per_group
+        return within // rows, first_m + within % rows
 
     @T.prim_func
     def main(
@@ -236,7 +261,7 @@ def rf_ws_gemm(M, N, K, schedule=None, block_M=128, block_N=128, block_K=256,
         SFB: T.Tensor((N * k_blocks, wpk), T.uint32),
         C: T.Tensor((M, N), out_dtype),
     ):
-        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=256) as (bx, by):
+        with T.Kernel(grid, threads=256) as block_id:
             A_shared = T.alloc_shared((num_stages, block_M, block_K), in_dtype)
             B_shared = T.alloc_shared((num_stages, block_N, block_K), in_dtype)
             SFA_shared = T.alloc_shared((num_stages, block_M, wpk), T.uint32)
@@ -260,10 +285,18 @@ def rf_ws_gemm(M, N, K, schedule=None, block_M=128, block_N=128, block_K=256,
             tx = T.get_thread_binding()
 
             if tx >= 128:
-                # Producer.
-                for ko in T.serial(k_blocks):
-                    stage = ko % num_stages
-                    phase = (ko // num_stages) & 1
+              # Producer.
+              for stream in T.serial(tile_iters):
+                tile_id = block_id + stream * tile_stride
+                if tile_id < total_tiles:
+                  bx, by = tile_coords(tile_id)
+                  for ko in T.serial(k_blocks):
+                    # Phase counter spans the CTA's lifetime, not one tile;
+                    # barriers are per-CTA so only the two sides here have to
+                    # agree, and they skip the same iterations.
+                    gko = stream * k_blocks + ko
+                    stage = gko % num_stages
+                    phase = (gko // num_stages) & 1
                     T.barrier_wait(consumed[stage], phase ^ 1)
                     T.tma_copy(
                         A[by * block_M:(by + 1) * block_M, ko * block_K:(ko + 1) * block_K],
@@ -287,11 +320,16 @@ def rf_ws_gemm(M, N, K, schedule=None, block_M=128, block_N=128, block_K=256,
                                 SFB[(bx * k_blocks + ko) * block_N + flat // wpk, flat % wpk]
                     T.barrier_arrive(loaded[stage])
             else:
-                # Consumer: the schedule, expanded at trace time.
-                T.clear(C_local)
-                for ko in T.serial(k_blocks):
-                    stage = ko % num_stages
-                    phase = (ko // num_stages) & 1
+              # Consumer: the schedule, expanded at trace time.
+              for stream in T.serial(tile_iters):
+                tile_id = block_id + stream * tile_stride
+                if tile_id < total_tiles:
+                  bx, by = tile_coords(tile_id)
+                  T.clear(C_local)
+                  for ko in T.serial(k_blocks):
+                    gko = stream * k_blocks + ko
+                    stage = gko % num_stages
+                    phase = (gko // num_stages) & 1
                     ctx = {
                         "pkgs": (pkg0, pkg1), "sps": (sp0, sp1),
                         "A_shared": A_shared, "B_shared": B_shared,
@@ -321,7 +359,9 @@ def rf_ws_gemm(M, N, K, schedule=None, block_M=128, block_N=128, block_K=256,
                     else:
                         _ = [_emit(op, ctx) for op in schedule]
 
-                T.copy(C_local, C[by * block_M, bx * block_N])
+                  T.copy(C_local,
+                         C[by * block_M:(by + 1) * block_M,
+                           bx * block_N:(bx + 1) * block_N])
 
     return main
 
