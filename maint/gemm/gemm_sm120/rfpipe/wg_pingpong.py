@@ -71,7 +71,8 @@ store_layout = _v3.store_layout
 
 @tilelang.jit(out_idx=None)
 def wg_pingpong_gemm(M, N, K, schedule=None, block_M=128, block_N=128, block_K=256,
-                     num_stages=2, out_dtype=T.bfloat16, group_m=1, order=True):
+                     num_stages=2, out_dtype=T.bfloat16, group_m=1, order=True,
+                     split_stages=False):
     # order=False is not a valid configuration, only a way to measure the
     # barriers' cost: the producer fills stages in one global order, so the two
     # consumers have to take them in that order or deadlock. Dropping the
@@ -138,18 +139,23 @@ def wg_pingpong_gemm(M, N, K, schedule=None, block_M=128, block_N=128, block_K=2
         C: T.Tensor((M, N), out_dtype),
     ):
         with T.Kernel(sm_num, threads=384) as block_id:
-            A_shared = T.alloc_shared((num_stages, block_M, block_K), in_dtype)
-            B_shared = T.alloc_shared((num_stages, block_N, block_K), in_dtype)
-            SFA_shared = T.alloc_shared((num_stages, block_M, wpk), T.uint32)
-            SFB_shared = T.alloc_shared((num_stages, block_N, wpk), T.uint32)
+            # split_stages gives each consumer its own set, so the producer
+            # can fill one consumer's next tile while the other is still
+            # consuming -- the handover no longer waits for a pipeline fill.
+            sets = 2 if split_stages else 1
+            all_stages = sets * num_stages
+            A_shared = T.alloc_shared((all_stages, block_M, block_K), in_dtype)
+            B_shared = T.alloc_shared((all_stages, block_N, block_K), in_dtype)
+            SFA_shared = T.alloc_shared((all_stages, block_M, wpk), T.uint32)
+            SFB_shared = T.alloc_shared((all_stages, block_N, wpk), T.uint32)
             pkg0 = T.alloc_local((32,), T.uint32)
             pkg1 = T.alloc_local((32,), T.uint32)
             sp0 = T.alloc_local((4,), T.uint32)
             sp1 = T.alloc_local((4,), T.uint32)
 
             # One consumer warpgroup owns any given stage, so 128 arrivals.
-            loaded = T.alloc_barrier([128] * num_stages)
-            consumed = T.alloc_barrier([128] * num_stages)
+            loaded = T.alloc_barrier([128] * all_stages)
+            consumed = T.alloc_barrier([128] * all_stages)
             # OrderedSequenceBarrier<2,2>: a two-element ring per stage.
             wg_order = T.alloc_barrier([128] * 2)
             store_order = T.alloc_barrier([128] * 2)
@@ -173,9 +179,15 @@ def wg_pingpong_gemm(M, N, K, schedule=None, block_M=128, block_N=128, block_K=2
                         if tile_id < total_tiles:
                             bx, by = tile_coords(tile_id)
                             for ko in T.serial(k_blocks):
-                                gko = (rnd * 2 + half) * k_blocks + ko
-                                stage = gko % num_stages
-                                phase = (gko // num_stages) & 1
+                                if split_stages:
+                                    # Each set sees exactly one tile per round.
+                                    gko = rnd * k_blocks + ko
+                                    stage = half * num_stages + gko % num_stages
+                                    phase = (gko // num_stages) & 1
+                                else:
+                                    gko = (rnd * 2 + half) * k_blocks + ko
+                                    stage = gko % num_stages
+                                    phase = (gko // num_stages) & 1
                                 T.barrier_wait(consumed[stage], phase ^ 1)
                                 T.tma_copy(
                                     A[by * block_M:(by + 1) * block_M,
@@ -231,9 +243,14 @@ def wg_pingpong_gemm(M, N, K, schedule=None, block_M=128, block_N=128, block_K=2
                         if order:
                             T.barrier_wait(wg_order[1], rnd & 1)
                         for ko in T.serial(k_blocks):
-                            gko = (rnd * 2 + 1) * k_blocks + ko
-                            stage = gko % num_stages
-                            phase = (gko // num_stages) & 1
+                            if split_stages:
+                                gko = rnd * k_blocks + ko
+                                stage = 1 * num_stages + gko % num_stages
+                                phase = (gko // num_stages) & 1
+                            else:
+                                gko = (rnd * 2 + 1) * k_blocks + ko
+                                stage = gko % num_stages
+                                phase = (gko // num_stages) & 1
                             _ = [_emit(op, ctx_for(bufs, C1, stage, phase))
                                  for op in schedule]
                         if order:

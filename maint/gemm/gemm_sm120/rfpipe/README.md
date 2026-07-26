@@ -144,12 +144,13 @@ less for it is to overlap it with another warpgroup's MMAs -- warpgroup
 pingpong -- which currently loses more than it saves because every tile handover
 waits for a pipeline fill.
 
-**A3 therefore reduces to one thing: make the tile handover in
-`wg_pingpong.py` not stall.** The two consumers share one stage set, so the
-producer can never be more than one stage ahead of whichever consumer it is
-feeding. Giving each consumer its own stage set, or a deeper pipeline, is what
-would let the incoming warpgroup start immediately -- and at block_K=128 the
-shared budget allows 2 sets x 2 stages (73728 B), which block_K=256 does not.
+Tried that too. Giving each consumer its own stage set (`split_stages`, two sets
+of two at block_K=128, 73728 B) is bitwise correct and worth **+4%**: 599.9
+against 575.9 at 4096³, still 44% below the single-consumer kernel's 1064.6. So
+the handover fill was not the dominant cost of warpgroup pingpong either, and
+**A3 has no open lead left**. Whatever makes the two-consumer structure lose
+half its throughput here is not the stage supply, and finding it needs a
+profiler rather than another structural variant.
 
 ### Constraints found the hard way
 
