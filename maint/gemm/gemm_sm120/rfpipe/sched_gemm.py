@@ -202,7 +202,7 @@ def _emit(op, ctx):
 @tilelang.jit(out_idx=None)
 def rf_ws_gemm(M, N, K, schedule=None, block_M=128, block_N=128, block_K=256,
                num_stages=2, out_dtype=T.bfloat16, use_emitter=False,
-               persistent=True, group_m=8):
+               persistent=True, group_m=8, _skip_epilogue=False):
     """use_emitter swaps the schedule for T.mma_gemm_blockscaled in the same
     kernel skeleton, so the two can be compared with only the inner loop
     differing. At block_K=256 the emitter routes to the package pingpong; at 128
@@ -359,9 +359,13 @@ def rf_ws_gemm(M, N, K, schedule=None, block_M=128, block_N=128, block_K=256,
                     else:
                         _ = [_emit(op, ctx) for op in schedule]
 
-                  T.copy(C_local,
-                         C[by * block_M:(by + 1) * block_M,
-                           bx * block_N:(bx + 1) * block_N])
+                  # _skip_epilogue is a diagnostic only: it produces wrong
+                  # output and bounds what any amount of epilogue hiding could
+                  # be worth.
+                  if not _skip_epilogue:
+                      T.copy(C_local,
+                             C[by * block_M:(by + 1) * block_M,
+                               bx * block_N:(bx + 1) * block_N])
 
     return main
 
