@@ -77,6 +77,30 @@ _spec = importlib.util.spec_from_file_location(
 sched_gemm = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(sched_gemm)
 
+def store_layout(emitter, buf, thread_offset):
+    """make_mma_store_layout, rebased onto a warpgroup's thread bounds.
+
+    Fragment.forward_thread maps an element to an *absolute* thread id, and
+    make_mma_store_layout produces 0..127 because it is normally used in a
+    region that starts at thread 0. Annotate a second warpgroup's accumulator
+    with those same ids and no thread in [128, 256) ever matches, so every
+    element's ownership predicate is false: LowerTileOp turns the T.clear and
+    the epilogue into empty loops and that half of C is never written, with no
+    diagnostic. Adding the region's thread base is the whole fix.
+
+    The production kernel does not need this only because T.mma_gemm_blockscaled
+    infers the layout in place; an annotated one has to say which threads it
+    means.
+    """
+    base = emitter.make_mma_store_layout(buf)
+    if thread_offset == 0:
+        return base
+    return T.Fragment(
+        buf.shape,
+        forward_fn=lambda i, j: (base.map_forward_thread([i, j])[0] + thread_offset,
+                                 base.map_forward_index([i, j])))
+
+
 _WRAPPERS_TEMPLATE = sched_gemm._WRAPPERS_TEMPLATE
 pingpong_schedule = sched_gemm.pingpong_schedule
 _emit = sched_gemm._emit
@@ -126,13 +150,7 @@ def coop_gemm(M, N, K, schedule=None, block_M=256, block_N=128, block_K=128,
             B_shared = T.alloc_shared((num_stages, block_N, block_K), in_dtype)
             SFA_shared = T.alloc_shared((num_stages, block_M, wpk), T.uint32)
             SFB_shared = T.alloc_shared((num_stages, block_N, wpk), T.uint32)
-            # One accumulator per consumer warpgroup. Sharing a single fragment
-            # across the two branches is what the production kernel avoids too:
-            # the store layout carries a thread mapping, and it is resolved per
-            # buffer, so the second warpgroup would epilogue through the first
-            # one's mapping.
-            C0_local = T.alloc_fragment((half_M, block_N), accum_dtype)
-            C1_local = T.alloc_fragment((half_M, block_N), accum_dtype)
+
             pkg0 = T.alloc_local((32,), T.uint32)
             pkg1 = T.alloc_local((32,), T.uint32)
             sp0 = T.alloc_local((4,), T.uint32)
@@ -145,8 +163,6 @@ def coop_gemm(M, N, K, schedule=None, block_M=256, block_N=128, block_K=128,
             T.annotate_layout({
                 A_shared: make_swizzled_layout(A_shared),
                 B_shared: make_swizzled_layout(B_shared),
-                C0_local: emitter.make_mma_store_layout(C0_local),
-                C1_local: emitter.make_mma_store_layout(C1_local),
             })
             T.import_source(_WRAPPERS_TEMPLATE.replace("__BLOCK_K__", str(block_K)))
 
@@ -181,6 +197,8 @@ def coop_gemm(M, N, K, schedule=None, block_M=256, block_N=128, block_K=128,
                                 SFB[(bx * k_blocks + ko) * block_N + flat // wpk, flat % wpk]
                     T.barrier_arrive(loaded[stage])
             elif tx < 128:
+                C0_local = T.alloc_fragment((half_M, block_N), accum_dtype)
+                T.annotate_layout({C0_local: store_layout(emitter, C0_local, 0)})
                 # Inlined, not a shared @T.macro called twice. With one macro
                 # invoked from both branches the second expansion keeps its
                 # opaque externs but loses its analyzable statements: no
@@ -209,6 +227,8 @@ def coop_gemm(M, N, K, schedule=None, block_M=256, block_N=128, block_K=128,
                        C[by * block_M + 0 * half_M:by * block_M + (0 + 1) * half_M,
                          bx * block_N:(bx + 1) * block_N])
             else:
+                C1_local = T.alloc_fragment((half_M, block_N), accum_dtype)
+                T.annotate_layout({C1_local: store_layout(emitter, C1_local, 128)})
                 # Inlined, not a shared @T.macro called twice. With one macro
                 # invoked from both branches the second expansion keeps its
                 # opaque externs but loses its analyzable statements: no
