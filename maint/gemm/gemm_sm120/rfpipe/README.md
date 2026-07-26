@@ -115,6 +115,25 @@ Protocol as stated above. `pers gm=N` is persistent with N-tile-row bands.
   unpacked on that path), halving the stage budget, and the scale vector size
   changes from 16 to 32.
 
+### What the epilogue cost actually is (measured, 4096³)
+
+| | TFLOPS |
+|---|---|
+| bf16 out, epilogue | 1060.7 |
+| **fp32 out**, epilogue (twice the bytes) | 1041.7 (**-1.8%**) |
+| no epilogue at all | 1407.0 (**+32.6%**) |
+
+Doubling the bytes written costs 1.8%; removing the epilogue gains 32.6%. So it
+is neither bandwidth nor the fp32-to-bf16 conversion -- it is the **access
+pattern**. `make_mma_store_layout` leaves each thread holding elements scattered
+across the tile, and walking that layout to a row-major destination is the cost.
+
+That also explains why staging through shared memory bought only 2%: the scatter
+moves from global to shared, it does not disappear. The fix has to change the
+pattern, not the destination -- rearrange within the warp before storing, or
+store through an epilogue tiling that is already coalesced, which is what
+CUTLASS's `epi_tile 64x32` is for.
+
 ### Constraints found the hard way
 
 - **`block_N` is not a free parameter.** The package primitives are built for a
