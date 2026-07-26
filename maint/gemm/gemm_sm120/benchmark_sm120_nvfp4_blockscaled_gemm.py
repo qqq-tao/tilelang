@@ -777,6 +777,25 @@ def _make_binary_scale_words(rows: int, k: int, *, seed: int) -> torch.Tensor:
     return _pack_scale_words(scale_bytes)
 
 
+def _make_ue4m3_scale_words(rows: int, k: int, *, seed: int) -> torch.Tensor:
+    """Full-entropy scale bytes, for performance measurement.
+
+    _make_binary_scale_words emits only {0x00, 0x38} because it exists to make
+    the reference exact (powers of two, no rounding). Reusing it for timing
+    understates power draw twice over: the scale broadcast path barely toggles,
+    and 0x00 is a zero scale, so about half the 16-element blocks contribute
+    nothing to the accumulator. Here the exponent field spans 6..8 and the
+    mantissa is uniform, giving 24 distinct values over [0.5, 3.75] -- wide
+    enough to be representative, narrow enough not to overflow.
+    """
+    generator = torch.Generator(device="cuda")
+    generator.manual_seed(seed)
+    scale_bytes = torch.randint(
+        0x30, 0x48, (rows, k // 16), device="cuda", dtype=torch.int64, generator=generator
+    )
+    return _pack_scale_words(scale_bytes)
+
+
 def _blockscaled_chunk_kmajor_word_offset(row: int, k64_word: int, block_rows: int = 128) -> tuple[int, int]:
     """Return compressed word coordinates for CUTLASS BlockScaledBasicChunk.
 
@@ -1021,6 +1040,9 @@ def run_tilelang(args: argparse.Namespace) -> tuple[float, float]:
         elif args.scale_mode == "random_binary":
             SFA_semantic = _make_binary_scale_words(args.m, args.k, seed=args.seed + 100)
             SFB_semantic = _make_binary_scale_words(args.n, args.k, seed=args.seed + 200)
+        elif args.scale_mode == "random_ue4m3":
+            SFA_semantic = _make_ue4m3_scale_words(args.m, args.k, seed=args.seed + 100)
+            SFB_semantic = _make_ue4m3_scale_words(args.n, args.k, seed=args.seed + 200)
         elif args.scale_mode == "random_sfa":
             SFA_semantic = _make_binary_scale_words(args.m, args.k, seed=args.seed + 100)
             SFB_semantic = _make_constant_scale_words(args.n, args.k)
@@ -1196,7 +1218,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input-mode", choices=["random", "ones", "bf16_quantized"], default="random")
     parser.add_argument(
         "--scale-mode",
-        choices=["constant", "random_binary", "random_sfa", "random_sfb"],
+        choices=["constant", "random_binary", "random_ue4m3", "random_sfa", "random_sfb"],
         default="constant",
     )
     parser.add_argument("--producer-regs", type=int, default=40)
