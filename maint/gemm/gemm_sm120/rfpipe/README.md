@@ -170,9 +170,15 @@ With `producer_regs=40, consumer_regs=224` (128x40 + 256x224 = 62464):
 | pingpong 4096³ | 575.9 | **881.7** (+53%) |
 | pingpong 8192³ | 651.2 | **1154.1** (+77%) |
 
-Still under the single-consumer kernel (1062.2 / 1232.9), but the structure is
-viable now rather than hopeless, and the quota split is itself a schedule
-parameter.
+Mt=256 gains too, 8192³ from ~1000 to 1125 with 40/224; a lower producer quota
+(24/240) is worse at 1094, so 40/224 is the operating point.
+
+Both are still under the single-consumer kernel (1062.2 / 1232.9), so the fix
+corrects the measurements without changing which configuration wins at any
+shape. What it does change is the reasoning: three earlier conclusions in this
+branch -- that warpgroup pingpong pays a pipeline fill per handover, that Mt=256
+is structurally limited, and that split stage sets are worth only 4% -- were all
+reading spill traffic.
 
 ### Constraints found the hard way
 
