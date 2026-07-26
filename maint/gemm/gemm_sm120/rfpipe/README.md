@@ -65,13 +65,29 @@ Protocol as stated above. `pers gm=N` is persistent with N-tile-row bands.
 - **A1 met.** `block_K` in {128, 256} crossed with `Mt` in {128, 256}, all bitwise
   identical to the template, from one generator, no per-configuration table.
 - **A2 met at 16384³, 2.2% short at 8192³.**
-- **A3 open.** 4096³ does not move: 1062.5 / 984.9 / 980.8 / 984.8 / 1053.2 across
-  tile, stage-count and band-width combinations. The production kernel measures
-  1069.9 there under the same protocol, so this is inherited, not introduced, and
-  it needs profiling rather than tuning. Note the shape of it: CUTLASS is
-  *faster* at 4096³ (1247.7) than at 8192³ (1191.8) while we are slower
-  (1062.5 vs 1224.0), so whatever it is scales with tile count or with k-loop
-  length, not with the working set.
+- **A3 open, but the cause is now known.** 4096³ does not respond to tuning:
+  1062.5 / 984.9 / 980.8 / 984.8 / 1053.2 across tile, stage-count and band-width
+  combinations, and the production kernel sits at 1069.9 under the same protocol.
+
+  Holding the tile count at 1024 and lengthening only K isolates it:
+
+  | k-iterations | 16 (=4096³) | 32 | 64 | 128 |
+  |---|---|---|---|---|
+  | TFLOPS | 1060.5 | 1132.4 | 1213.7 | 1213.8 |
+
+  Same tiles, same waves, same rasterisation; throughput saturates at 1213.8, so
+  a short k-loop costs **12.6%** at 4096³ -- which is the whole gap. It is a
+  fixed cost per tile, and with a persistent kernel the pipeline runs
+  continuously across tile boundaries, so the only per-tile fixed cost left is
+  the epilogue: a 128x128 fp32 to bf16 store serialised against the MMAs.
+
+  That is precisely what warpgroup-level pingpong exists to hide -- CUTLASS says
+  so in as many words at `sm90_gemm_tma_warpspecialized_pingpong.hpp:846`,
+  "Order two Math WG's MMA one after the other, helps hide Epilogue". Our two
+  consumer warpgroups currently split M within one tile, so both epilogue at the
+  same time and neither hides. Pointing them at alternating tiles with an
+  ordering barrier between them is the fix, and v3_coop.py already has the two
+  warpgroups and their thread-rebased layouts.
 - **A4 met for addressing** (swizzle from the 4-line atom rule, no hand tables);
   the accumulator layout is annotated rather than inferred, which works but
   needs the thread rebase below.
