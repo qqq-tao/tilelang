@@ -180,6 +180,14 @@ branch -- that warpgroup pingpong pays a pipeline fill per handover, that Mt=256
 is structurally limited, and that split stage sets are worth only 4% -- were all
 reading spill traffic.
 
+### Register quotas: required at 384 threads, a no-op at 256
+
+`T.set_max_nreg` is what makes the 384-thread kernels viable (above), but it does
+nothing for the 256-thread single-consumer kernel: 1060.3 default against 1062.9
+at 40/240 and 1059.4 at 32/248 (4096³), and slightly *worse* at 8192³. That
+kernel settles at 218 registers with no spill and one CTA per SM either way, so
+there is nothing to trade. Check the spill count before reaching for the knob.
+
 ### Constraints found the hard way
 
 - **`block_N` is not a free parameter.** The package primitives are built for a

@@ -214,6 +214,7 @@ def _emit(op, ctx):
 def rf_ws_gemm(M, N, K, schedule=None, block_M=128, block_N=128, block_K=256,
                num_stages=2, out_dtype=T.bfloat16, use_emitter=False,
                persistent=True, group_m=8, _skip_epilogue=False,
+               producer_regs=0, consumer_regs=0,
                async_epilogue=False, panel_M=None, swizzle_cshared=True):
     # panel_M=None stages the whole tile: slicing an mma store-layout
     # fragment by rows yields a layout the normaliser rejects.
@@ -314,7 +315,13 @@ def rf_ws_gemm(M, N, K, schedule=None, block_M=128, block_N=128, block_K=256,
             tx = T.get_thread_binding()
 
             if tx >= 128:
-              # Producer.
+              # Producer. It only addresses TMA descriptors, so handing its
+              # register quota to the consumer is free -- 128*40 + 128*240 is
+              # 35840 of 65536, nowhere near the cap. Worth trying because the
+              # kernel settles at 218 registers unprompted and there is one CTA
+              # per SM either way, so nothing is traded for it.
+              if producer_regs > 0:
+                  T.set_max_nreg(producer_regs, 0)
               for stream in T.serial(tile_iters):
                 tile_id = block_id + stream * tile_stride
                 if tile_id < total_tiles:
@@ -350,6 +357,8 @@ def rf_ws_gemm(M, N, K, schedule=None, block_M=128, block_N=128, block_K=256,
                     T.barrier_arrive(loaded[stage])
             else:
               # Consumer: the schedule, expanded at trace time.
+              if consumer_regs > 0:
+                  T.set_max_nreg(consumer_regs, 1)
               for stream in T.serial(tile_iters):
                 tile_id = block_id + stream * tile_stride
                 if tile_id < total_tiles:
