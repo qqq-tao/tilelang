@@ -83,11 +83,23 @@ Protocol as stated above. `pers gm=N` is persistent with N-tile-row bands.
 
   That is precisely what warpgroup-level pingpong exists to hide -- CUTLASS says
   so in as many words at `sm90_gemm_tma_warpspecialized_pingpong.hpp:846`,
-  "Order two Math WG's MMA one after the other, helps hide Epilogue". Our two
-  consumer warpgroups currently split M within one tile, so both epilogue at the
-  same time and neither hides. Pointing them at alternating tiles with an
-  ordering barrier between them is the fix, and v3_coop.py already has the two
-  warpgroups and their thread-rebased layouts.
+  ordering the two math warpgroups' MMAs so one hides the other's epilogue.
+
+  **Built it (`wg_pingpong.py`), and it is bitwise correct and much slower**:
+  597.6 / 755.3 / 750.7 at 4096³ / 8192³ / 16384³ against 1059.0 / 1226.0 /
+  1158.1 for the single-consumer kernel. The two consumers alternate whole
+  tiles, and with only two pipeline stages the producer can never be more than
+  one stage ahead, so at every tile handover the incoming warpgroup waits for a
+  full pipeline fill. That costs far more than the epilogue it hides. CUTLASS
+  runs the same structure at the same stage count and does not pay this, so the
+  difference is in the handover, not in the ordering barriers -- which are
+  required, not optional: dropping them deadlocks, since the producer fills
+  stages in one global order.
+
+  Next thing to try there is overlapping the handover: let the producer run
+  ahead into the next tile rather than gating on the current consumer, which
+  needs the two consumers on separate stage sets or a deeper pipeline than the
+  99 KiB budget currently allows at this tile.
 - **A4 met for addressing** (swizzle from the 4-line atom rule, no hand tables);
   the accumulator layout is annotated rather than inferred, which works but
   needs the thread rebase below.
