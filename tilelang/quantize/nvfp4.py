@@ -44,12 +44,22 @@ def _import_torch():
 
 
 def _check_block_shape(block_rows: int, block_words: int) -> None:
-    if block_rows != _BLOCKSCALED_CHUNK_ROWS or block_words != _BLOCKSCALED_CHUNK_WORDS:
+    # block_rows is a genuine layout constraint: the packing splits the row block
+    # as 4 x 32 (see swizzle_blockscaled_chunk_kmajor_scale_words), which is what
+    # the device-side sm120_blockscaled_chunk_kmajor_sf_word inverts.
+    #
+    # block_words is not. It is how many K64 words one tile spans, i.e. a tiling
+    # choice (block_K // 64), and the physical layout does not depend on it --
+    # the permute is over the full K extent, and the word offset ki * 128 +
+    # (row % 32) * 4 + row // 32 has no block_words in it. Pinning it to 4 was
+    # over-strict and made block_K=128 unreachable from the host side.
+    if block_rows != _BLOCKSCALED_CHUNK_ROWS:
         raise ValueError(
             "SM120 BlockScaledBasicChunk K-major scale packing currently supports "
-            f"block_rows={_BLOCKSCALED_CHUNK_ROWS} and block_words={_BLOCKSCALED_CHUNK_WORDS}, "
-            f"got block_rows={block_rows}, block_words={block_words}"
+            f"block_rows={_BLOCKSCALED_CHUNK_ROWS}, got block_rows={block_rows}"
         )
+    if block_words < 1:
+        raise ValueError(f"block_words must be a positive K64 word count, got {block_words}")
 
 
 def _scale_layout_id(scale_layout: str) -> int:

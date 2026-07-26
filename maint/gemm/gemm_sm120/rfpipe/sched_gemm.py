@@ -72,14 +72,14 @@ from tilelang.quantize import swizzle_blockscaled_chunk_kmajor_scale_words
 # buffer identity and the access mask that the passes need, and the offset
 # selects the pipeline stage. Note the scale copy lives in tl::detail, the
 # other two at tl:: scope.
-_WRAPPERS = r"""
+_WRAPPERS_TEMPLATE = r"""
 #include <tl_templates/cuda/gemm_sm120.h>
 
 extern "C" {
 
 TL_DEVICE void tl_rf_copy_ab(void *pkg, const void *a_base, int a_off,
                              const void *b_base, int b_off, int kblock) {
-  tl::sm120_copy_fulltile_ab_owner_wide_package(
+  tl::sm120_copy_fulltile_ab_owner_wide_package<__BLOCK_K__>(
       *reinterpret_cast<tl::SM120FulltileABOwnerWidePackage *>(pkg),
       static_cast<const char *>(a_base) + a_off,
       static_cast<const char *>(b_base) + b_off, kblock);
@@ -104,32 +104,40 @@ TL_DEVICE void tl_rf_gemm(void *c, const void *pkg, const void *spkg) {
 }
 """
 
-# The template's schedule, now including the pipeline operations it performs
-# implicitly by where its loop begins and ends.
-PINGPONG_4 = (
+def pingpong_schedule(kblocks, n_pkg=2, early_release=False):
+    """The template's pingpong, for any number of k-blocks and packages.
+
+    Fill every package, then walk the k-blocks issuing package kb % n_pkg and
+    immediately refilling it with the k-block n_pkg ahead. For kblocks=4,
+    n_pkg=2 this reproduces the hand-written sequence exactly; for kblocks=2 it
+    degenerates to fill-both-then-issue-both, which is what block_K=128 needs
+    and what the generic path used to fall back to a serial loop for.
+    """
+    ops = [("wait", "loaded")]
+    for i in range(min(n_pkg, kblocks)):
+        ops += [("cp", i, i), ("sf", i, i)]
+    for kb in range(kblocks):
+        p = kb % n_pkg
+        if early_release and kb == kblocks - n_pkg:
+            ops.append(("arrive", "consumed"))
+        ops.append(("mma", p))
+        if kb + n_pkg < kblocks:
+            ops += [("cp", p, kb + n_pkg), ("sf", p, kb + n_pkg)]
+    if not early_release:
+        ops.append(("arrive", "consumed"))
+    return tuple(ops)
+
+
+# What the C++ template hard-codes, recovered from the generator.
+PINGPONG_4 = pingpong_schedule(4)
+assert PINGPONG_4 == (
     ("wait", "loaded"),
-    ("cp", 0, 0), ("sf", 0, 0),
-    ("cp", 1, 1), ("sf", 1, 1),
+    ("cp", 0, 0), ("sf", 0, 0), ("cp", 1, 1), ("sf", 1, 1),
     ("mma", 0), ("cp", 0, 2), ("sf", 0, 2),
     ("mma", 1), ("cp", 1, 3), ("sf", 1, 3),
     ("mma", 0), ("mma", 1),
     ("arrive", "consumed"),
-)
-
-# Same packages, same order, one operation moved: the stage is released as soon
-# as the last read of shared memory has happened, so the producer can refill it
-# while the final two MMAs still run. Not expressible as a template parameter.
-PINGPONG_4_EARLY = (
-    ("wait", "loaded"),
-    ("cp", 0, 0), ("sf", 0, 0),
-    ("cp", 1, 1), ("sf", 1, 1),
-    ("mma", 0), ("cp", 0, 2), ("sf", 0, 2),
-    ("mma", 1), ("cp", 1, 3), ("sf", 1, 3),
-    ("arrive", "consumed"),
-    ("mma", 0), ("mma", 1),
-)
-
-SCHEDULES = {"baseline": PINGPONG_4, "early-release": PINGPONG_4_EARLY}
+), "generator no longer reproduces the hand-written schedule"
 
 
 @T.macro
@@ -191,8 +199,10 @@ def _emit(op, ctx):
 
 
 @tilelang.jit(out_idx=None)
-def rf_ws_gemm(M, N, K, schedule, block_M=128, block_N=128, block_K=256,
+def rf_ws_gemm(M, N, K, schedule=None, block_M=128, block_N=128, block_K=256,
                num_stages=2, out_dtype=T.bfloat16):
+    if schedule is None:
+        schedule = pingpong_schedule(block_K // 64)
     assert M % block_M == 0 and N % block_N == 0 and K % block_K == 0
     in_dtype = T.float4_e2m1fn
     accum_dtype = T.float32
@@ -241,7 +251,7 @@ def rf_ws_gemm(M, N, K, schedule, block_M=128, block_N=128, block_K=256,
                 B_shared: make_swizzled_layout(B_shared),
                 C_local: emitter.make_mma_store_layout(C_local),
             })
-            T.import_source(_WRAPPERS)
+            T.import_source(_WRAPPERS_TEMPLATE.replace("__BLOCK_K__", str(block_K)))
 
             tx = T.get_thread_binding()
 
@@ -305,49 +315,61 @@ def _load_example():
     return mod
 
 
-def _make_inputs(mod, M, N, K):
+def _make_inputs(mod, M, N, K, block_K=256):
+    wpk = block_K // 64
     A = mod._make_packed_fp4(M, K, seed=71)
     B = mod._make_packed_fp4(N, K, seed=72)
     SFA = swizzle_blockscaled_chunk_kmajor_scale_words(
-        mod._make_binary_scale_words(M, K, seed=73)).reshape(-1, 4)
+        mod._make_binary_scale_words(M, K, seed=73), block_words=wpk).reshape(-1, wpk)
     SFB = swizzle_blockscaled_chunk_kmajor_scale_words(
-        mod._make_binary_scale_words(N, K, seed=74)).reshape(-1, 4)
+        mod._make_binary_scale_words(N, K, seed=74), block_words=wpk).reshape(-1, wpk)
     return A, B, SFA, SFB
 
 
 def main():
     mod = _load_example()
 
-    print("=== correctness (bitwise vs the hand-written template) ===")
-    for name, sched in SCHEDULES.items():
-        for M, N, K in [(256, 256, 512), (1024, 1024, 1024), (2048, 2048, 2048)]:
-            A, B, SFA, SFB = _make_inputs(mod, M, N, K)
-            C_ref = torch.empty((M, N), device="cuda", dtype=torch.bfloat16)
-            mod.sm120_nvfp4_blockscaled_gemm(M, N, K)(A, B, SFA, SFB, C_ref)
-            C_v15 = torch.empty((M, N), device="cuda", dtype=torch.bfloat16)
-            rf_ws_gemm(M, N, K, sched)(A, B, SFA, SFB, C_v15)
-            torch.cuda.synchronize()
-            same = torch.equal(C_v15.view(torch.uint16), C_ref.view(torch.uint16))
-            print(f"  {name:14s} {M}x{N}x{K}: {'BITWISE IDENTICAL' if same else 'MISMATCH'}",
-                  flush=True)
-            if not same:
-                d = (C_v15.float() - C_ref.float()).abs()
-                print(f"    max |diff| {d.max().item()}, "
-                      f"mismatch frac {(d > 0).float().mean().item():.4f}")
+    print("=== correctness: bitwise vs the hand-written template (block_K=256) ===")
+    for block_K in (256, 128):
+        kblocks = block_K // 64
+        for label, sched in (("pingpong", pingpong_schedule(kblocks)),
+                             ("early-release", pingpong_schedule(kblocks, early_release=True))):
+            for M, N, K in [(256, 256, 512), (1024, 1024, 1024), (2048, 2048, 2048)]:
+                A_r, B_r, SFA_r, SFB_r = _make_inputs(mod, M, N, K, 256)
+                C_ref = torch.empty((M, N), device="cuda", dtype=torch.bfloat16)
+                mod.sm120_nvfp4_blockscaled_gemm(M, N, K)(A_r, B_r, SFA_r, SFB_r, C_ref)
+
+                A, B, SFA, SFB = _make_inputs(mod, M, N, K, block_K)
+                C_out = torch.empty((M, N), device="cuda", dtype=torch.bfloat16)
+                rf_ws_gemm(M, N, K, sched, block_K=block_K)(A, B, SFA, SFB, C_out)
+                torch.cuda.synchronize()
+                same = torch.equal(C_out.view(torch.uint16), C_ref.view(torch.uint16))
+                tag = f"block_K={block_K} {label}"
+                print(f"  {tag:28s} {M}x{N}x{K}: "
+                      f"{'BITWISE IDENTICAL' if same else 'MISMATCH'}", flush=True)
+                if not same:
+                    d = (C_out.float() - C_ref.float()).abs()
+                    print(f"    max |diff| {d.max().item()}, "
+                          f"mismatch frac {(d > 0).float().mean().item():.4f}")
 
     print("=== throughput @ 2048^3 (median of 3) ===")
     M = N = K = 2048
-    A, B, SFA, SFB = _make_inputs(mod, M, N, K)
     C = torch.empty((M, N), device="cuda", dtype=torch.bfloat16)
-    kernels = [("template (T.mma_gemm_blockscaled)", mod.sm120_nvfp4_blockscaled_gemm(M, N, K))]
-    kernels += [(f"schedule-as-data ({n})", rf_ws_gemm(M, N, K, s)) for n, s in SCHEDULES.items()]
-    for name, kern in kernels:
-        kern(A, B, SFA, SFB, C)
+    entries = []
+    A256, B256, SFA256, SFB256 = _make_inputs(mod, M, N, K, 256)
+    entries.append(("template (block_K=256)", mod.sm120_nvfp4_blockscaled_gemm(M, N, K),
+                    (A256, B256, SFA256, SFB256)))
+    for block_K in (256, 128):
+        ins = _make_inputs(mod, M, N, K, block_K)
+        entries.append((f"schedule-as-data (block_K={block_K})",
+                        rf_ws_gemm(M, N, K, block_K=block_K), ins))
+    for name, kern, ins in entries:
+        kern(*ins, C)
         torch.cuda.synchronize()
         ms = statistics.median(
-            do_bench(lambda k=kern: k(A, B, SFA, SFB, C), _n_warmup=25, _n_repeat=100)
+            do_bench(lambda k=kern, i=ins: k(*i, C), _n_warmup=25, _n_repeat=100)
             for _ in range(3))
-        print(f"  {name:38s} {ms:.4f} ms  {2.0 * M * N * K / (ms * 1e-3) / 1e12:7.1f} TFLOPS",
+        print(f"  {name:34s} {ms:.4f} ms  {2.0 * M * N * K / (ms * 1e-3) / 1e12:7.1f} TFLOPS",
               flush=True)
 
 

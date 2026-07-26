@@ -155,38 +155,60 @@ TL_DEVICE void sm120_mma_m16n8k64_mxf4nvf4_4x_ue4m3(
       scale_a_byte_id, scale_a_thread_id, scale_b_byte_id, scale_b_thread_id);
 }
 
-TL_DEVICE uint32_t sm120_fulltile_k_swizzle_offset(uint32_t tx,
-                                                   int k_block_idx) {
-  switch (k_block_idx & 3) {
-  case 0:
-    return ((tx & 7u) >> 1) * 32u;
-  case 1:
-    return ((tx & 7u) >> 2) * 64u + (((((tx & 3u) >> 1) + 1u) & 1u) * 32u);
-  case 2:
-    return (((((tx & 7u) >> 2) + 1u) & 1u) * 64u) + (((tx & 3u) >> 1) * 32u);
-  default:
-    return (((((tx & 7u) >> 2) + 1u) & 1u) * 64u) +
-           (((((tx & 3u) >> 1) + 1u) & 1u) * 32u);
-  }
+// The whole of the shared-memory swizzle, in one expression.
+//
+// Both TileLang (MakeGemmABLayout, src/layout/gemm_layouts.cc) and CUTLASS
+// (sm120_rr_smem_selector, sm120_common.inl) pick the widest swizzle atom whose
+// extent divides the row.  For a row that is Cols16 sixteen-byte units wide
+// that atom XORs the low log2(Cols16) bits of the row index into the column
+// index, and nothing else.  A packed-FP4 row of BlockK elements is BlockK/2
+// bytes, so Cols16 = BlockK/32: block_K 256 gives 8 columns (the 128-byte,
+// three-level atom), block_K 128 gives 4 (the 64-byte, two-level one).
+//
+// Writing it this way is what makes the addressing block_K-generic.  It used to
+// be a four-case table over k_block_idx & 3, which was that XOR expanded by hand
+// for Cols16 == 8 and therefore silently wrong for any other tile K.
+template <uint32_t Cols16>
+TL_DEVICE uint32_t sm120_swizzled_byte_offset(uint32_t row, uint32_t col16) {
+  static_assert(Cols16 != 0u && (Cols16 & (Cols16 - 1u)) == 0u,
+                "swizzle width must be a power of two");
+  static_assert(Cols16 <= 8u,
+                "rows wider than 128 B tile the 128 B atom rather than "
+                "selecting a wider one; that case needs the tile index too");
+  // Which row bits feed the XOR is not fixed: the three atoms are
+  // Swizzle<3,4,3>, Swizzle<2,4,3> and Swizzle<1,4,3>, so the *source* is always
+  // bits [7, 7+B) of the linear offset while the row field starts at bit
+  // 4 + log2(Cols16).  The row therefore contributes from bit 3 - log2(Cols16):
+  // 0 for a 128-byte row, 1 for 64 bytes, 2 for 32.  Reading it as `row &
+  // (Cols16 - 1)` happens to be right only for the 128-byte case, which is why
+  // the hand-expanded table looked correct for block_K=256 and silently was not
+  // a general rule.
+  constexpr uint32_t kRowShift = (Cols16 == 8u) ? 0u : (Cols16 == 4u) ? 1u : (Cols16 == 2u) ? 2u : 3u;
+  return row * (Cols16 * 16u) +
+         ((col16 ^ ((row >> kRowShift) & (Cols16 - 1u))) * 16u);
 }
 
 // A/B operands are staged into shared memory as row-major tiles (the layout
 // produced by T.copy for a (block, block_K) packed-FP4 buffer).  Each offset
-// below resolves one ldmatrix.x4 source address for the current thread.
+// below resolves one ldmatrix.x4 source address for the current thread: the
+// lane bits give the row and which 16-byte half of the k-block it reads, and
+// the swizzle above places it.
+template <int BlockK>
 TL_DEVICE uint32_t sm120_fulltile_package_a_offset(uint32_t tx, int k_block_idx,
                                                    int row_idx) {
-  return (((tx & 63u) >> 5) * 8192u) + ((tx & 15u) * 128u) +
-         sm120_fulltile_k_swizzle_offset(tx, k_block_idx) +
-         (((((tx & 31u) >> 4) + (tx & 1u)) & 1u) * 16u) +
-         uint32_t(row_idx) * 2048u;
+  uint32_t const row =
+      ((tx >> 5) & 1u) * 64u + (tx & 15u) + uint32_t(row_idx) * 16u;
+  return sm120_swizzled_byte_offset<uint32_t(BlockK) / 32u>(
+      row, uint32_t(k_block_idx) * 2u + ((tx >> 4) & 1u));
 }
 
+template <int BlockK>
 TL_DEVICE uint32_t sm120_fulltile_package_b_offset(uint32_t tx, int k_block_idx,
                                                    int panel_idx) {
-  return ((tx >> 6) * 8192u) + (((tx & 31u) >> 4) * 1024u) +
-         ((tx & 7u) * 128u) + sm120_fulltile_k_swizzle_offset(tx, k_block_idx) +
-         (((((tx & 15u) >> 3) + (tx & 1u)) & 1u) * 16u) +
-         uint32_t(panel_idx) * 2048u;
+  uint32_t const row = (tx >> 6) * 64u + ((tx >> 4) & 1u) * 8u + (tx & 7u) +
+                       uint32_t(panel_idx) * 16u;
+  return sm120_swizzled_byte_offset<uint32_t(BlockK) / 32u>(
+      row, uint32_t(k_block_idx) * 2u + ((tx >> 3) & 1u));
 }
 
 } // namespace detail
@@ -224,6 +246,7 @@ struct SM120FulltileABOwnerWidePackage {
   uint32_t b30, b31, b32, b33;
 };
 
+template <int BlockK = 256>
 TL_DEVICE void
 sm120_copy_fulltile_ab_owner_wide_package(SM120FulltileABOwnerWidePackage &pkg,
                                           const char *a_base,
@@ -231,29 +254,29 @@ sm120_copy_fulltile_ab_owner_wide_package(SM120FulltileABOwnerWidePackage &pkg,
   uint32_t const tx = uint32_t(int(threadIdx.x) & 127);
 
   detail::sm120_ldmatrix_x4_blockscaled_operand(
-      a_base + detail::sm120_fulltile_package_a_offset(tx, k_block_idx, 0),
+      a_base + detail::sm120_fulltile_package_a_offset<BlockK>(tx, k_block_idx, 0),
       pkg.a00, pkg.a01, pkg.a02, pkg.a03);
   detail::sm120_ldmatrix_x4_blockscaled_operand(
-      a_base + detail::sm120_fulltile_package_a_offset(tx, k_block_idx, 1),
+      a_base + detail::sm120_fulltile_package_a_offset<BlockK>(tx, k_block_idx, 1),
       pkg.a10, pkg.a11, pkg.a12, pkg.a13);
   detail::sm120_ldmatrix_x4_blockscaled_operand(
-      a_base + detail::sm120_fulltile_package_a_offset(tx, k_block_idx, 2),
+      a_base + detail::sm120_fulltile_package_a_offset<BlockK>(tx, k_block_idx, 2),
       pkg.a20, pkg.a21, pkg.a22, pkg.a23);
   detail::sm120_ldmatrix_x4_blockscaled_operand(
-      a_base + detail::sm120_fulltile_package_a_offset(tx, k_block_idx, 3),
+      a_base + detail::sm120_fulltile_package_a_offset<BlockK>(tx, k_block_idx, 3),
       pkg.a30, pkg.a31, pkg.a32, pkg.a33);
 
   detail::sm120_ldmatrix_x4_blockscaled_operand(
-      b_base + detail::sm120_fulltile_package_b_offset(tx, k_block_idx, 0),
+      b_base + detail::sm120_fulltile_package_b_offset<BlockK>(tx, k_block_idx, 0),
       pkg.b00, pkg.b01, pkg.b02, pkg.b03);
   detail::sm120_ldmatrix_x4_blockscaled_operand(
-      b_base + detail::sm120_fulltile_package_b_offset(tx, k_block_idx, 1),
+      b_base + detail::sm120_fulltile_package_b_offset<BlockK>(tx, k_block_idx, 1),
       pkg.b10, pkg.b11, pkg.b12, pkg.b13);
   detail::sm120_ldmatrix_x4_blockscaled_operand(
-      b_base + detail::sm120_fulltile_package_b_offset(tx, k_block_idx, 2),
+      b_base + detail::sm120_fulltile_package_b_offset<BlockK>(tx, k_block_idx, 2),
       pkg.b20, pkg.b21, pkg.b22, pkg.b23);
   detail::sm120_ldmatrix_x4_blockscaled_operand(
-      b_base + detail::sm120_fulltile_package_b_offset(tx, k_block_idx, 3),
+      b_base + detail::sm120_fulltile_package_b_offset<BlockK>(tx, k_block_idx, 3),
       pkg.b30, pkg.b31, pkg.b32, pkg.b33);
 }
 
