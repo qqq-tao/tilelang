@@ -20,6 +20,74 @@ description; a new tile shape, a new dtype family, or a new issue order is a
 schedule parameter rather than a new template. MXFP8 support then costs an
 operand-type entry, not a second monolith.
 
+
+### What "done" means, and how it is checked
+
+All figures below are the **sustained, high-entropy** protocol: full-byte-domain
+FP4 operands, `--scale-mode random_ue4m3`, 200 warmup iterations, order rotated
+across rounds, median of three. Numbers taken any other way are not comparable;
+a short warmup alone reads ~6% high on this board, and low-entropy scales
+another ~4%.
+
+**A1 -- expressible.** `block_K` in {128, 256} crossed with `Mt` in {128, 256},
+all bitwise identical to the shipped template, from one schedule generator with
+no per-configuration offset table.
+
+**A2 -- matches the vendor where the vendor is strongest.** CUTLASS C++ 79a,
+same protocol, `256x128x128` cooperative: **1251 TFLOPS at 8192^3** and **1058.7
+at 16384^3**. Those are the targets for Mt=256.
+
+**A3 -- fixes our weak shape.** At 4096^3 we currently reach 1069.9 against
+CUTLASS's 1247.7 on the same tile, **-14.3%**. This is the one shape where we
+are clearly behind and it has never been investigated.
+
+**A4 -- upstreamable.** No new hand-written address tables; the swizzle comes
+from the 4-line atom rule, the accumulator layout from inference, and the
+schedule from a generator.
+
+**A5 -- both families.** `mxf8f6f4` as well as `mxf4nvf4`. Only NVFP4 has been
+touched so far, and MXFP8 is not a free ride: its shared-memory elements are 1.0
+bytes rather than 0.5 (fp4 and fp6 are unpacked on that path), which halves the
+stage budget, and CUTLASS applies an `fp4_shift` after the fragment load that we
+have no equivalent for.
+
+### Order of work, revised by what the prototype found
+
+1. **Fold the package operations into the emitter.** This moved from "later
+   cleanup" to *prerequisite*: a second consumer warpgroup needs the accumulator
+   layout to come from inference, and an opaque `call_extern` gives inference
+   nothing to read (see `repro_two_branch_store_layout.py`). Everything below
+   waits on this.
+2. **Mt=256 cooperative** (`v3_coop.py`), which is otherwise designed and
+   half-validated: split M rather than N, three pipeline stages.
+3. **Shape routing.** Mt=256 wins only at 8192^3 and above -- CUTLASS measures it
+   *losing* 7.9% at 4096^3 -- so the tile has to be chosen per shape, and A3
+   lives here.
+4. **`mxf8f6f4`.**
+
+### Not goals, on evidence
+
+- **Searching the emission order.** The one reordering the vocabulary made
+  newly expressible -- releasing the pipeline stage after the last shared-memory
+  read instead of after the last MMA -- measured **-0.45% / +0.03%** over five
+  interleaved rounds. The CUTLASS study puts schedule choice at +3~11% against
+  +31~41% for pipeline depth. The value of schedule-as-data is that it makes
+  K=128 and Mt=256 *expressible* (K=128 block-scaled is otherwise a hard
+  `ValueError`), not that a better permutation is waiting to be found.
+- **Beating the vendor at 128x128x256.** Already parity: schedule-as-data is
+  within 1.3% of the hand-written template in an identical skeleton, and the
+  kernel is +3.3% on CUTLASS's same tile at 8192^3. Not the bottleneck.
+
+### Known risks
+
+- Folding into the emitter is an intrusive upstream change; the interface should
+  be agreed with the maintainer before it is built, not after.
+- Staging scale factors by TMA the way CUTLASS does needs a layout whose domain
+  is (M, K) and whose codomain is the blocked array. If TileLang cannot express
+  that, the producer keeps its 128-lane strided copy and the gap stays.
+- `mxf8f6f4` has never been compiled on this path. Halving the stage budget puts
+  it near the 1->2 stage cliff, which is the steepest part of the curve.
+
 ### Why Mt=256 forces this (the concrete driver)
 
 ```
