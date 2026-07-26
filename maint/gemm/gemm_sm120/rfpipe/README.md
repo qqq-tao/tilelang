@@ -59,12 +59,14 @@ Protocol as stated above. `pers gm=N` is persistent with N-tile-row bands.
 | | ours | config | target | |
 |---|---|---|---|---|
 | 4096³ | 1062.5 | Mt=128 bK=256 pers gm=1 | 1247.7 | **-14.8%** |
-| 8192³ | 1230.6 | Mt=128 bK=256 pers gm=1 | 1251.0 | -1.6% |
+| 8192³ | 1229.6 | Mt=128 bK=256 pers gm=1 | 1251.0 | **-1.7%** |
 | 16384³ | **1149.0** | Mt=128 bK=256 pers gm=16 | 1058.7 | **+8.5%** |
 
 - **A1 met.** `block_K` in {128, 256} crossed with `Mt` in {128, 256}, all bitwise
   identical to the template, from one generator, no per-configuration table.
-- **A2 met at 16384³, 1.6% short at 8192³.** group_m does not close it:
+- **A2 met at 16384³, 1.7% short at 8192³**, settled over five rounds:
+  median 1229.6, min 1224.3, max 1230.3. A single earlier reading of 1247.1
+  was the max of a two-round sample, not a representative value. group_m does not close it:
   1230.6 / 1230.5 / 1214.5 / 1229.7 / 1211.5 for 1 / 2 / 3 / 4 / 6, and
   1219.8 non-persistent. The remaining 1.6% is the same epilogue cost as A3.
 - **A3 open, but the cause is now known.** 4096³ does not respond to tuning:
