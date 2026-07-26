@@ -51,19 +51,59 @@ bytes rather than 0.5 (fp4 and fp6 are unpacked on that path), which halves the
 stage budget, and CUTLASS applies an `fp4_shift` after the fragment load that we
 have no equivalent for.
 
+
+### Status against the acceptance criteria (2026-07-27)
+
+Protocol as stated above. `pers gm=N` is persistent with N-tile-row bands.
+
+| | ours | config | target | |
+|---|---|---|---|---|
+| 4096³ | 1062.5 | Mt=128 bK=256 pers gm=1 | 1247.7 | **-14.8%** |
+| 8192³ | 1224.0 | Mt=128 bK=256 pers gm=1 | 1251.0 | -2.2% |
+| 16384³ | **1149.0** | Mt=128 bK=256 pers gm=16 | 1058.7 | **+8.5%** |
+
+- **A1 met.** `block_K` in {128, 256} crossed with `Mt` in {128, 256}, all bitwise
+  identical to the template, from one generator, no per-configuration table.
+- **A2 met at 16384³, 2.2% short at 8192³.**
+- **A3 open.** 4096³ does not move: 1062.5 / 984.9 / 980.8 / 984.8 / 1053.2 across
+  tile, stage-count and band-width combinations. The production kernel measures
+  1069.9 there under the same protocol, so this is inherited, not introduced, and
+  it needs profiling rather than tuning. Note the shape of it: CUTLASS is
+  *faster* at 4096³ (1247.7) than at 8192³ (1191.8) while we are slower
+  (1062.5 vs 1224.0), so whatever it is scales with tile count or with k-loop
+  length, not with the working set.
+- **A4 met for addressing** (swizzle from the 4-line atom rule, no hand tables);
+  the accumulator layout is annotated rather than inferred, which works but
+  needs the thread rebase below.
+- **A5 not started.** `mxf8f6f4`.
+
+### Constraints found the hard way
+
+- **`block_N` is not a free parameter.** The package primitives are built for a
+  2x2 warp grid of 64x64 tiles, i.e. 128 columns. `block_N=64` compiles and then
+  reads out of bounds -- the TMA descriptor fails with an illegal address.
+- **An annotated accumulator layout must be rebased onto its warpgroup's
+  threads.** `Fragment.forward_thread` returns an absolute thread id and
+  `make_mma_store_layout` emits 0..127, so a second warpgroup annotated with it
+  matches no thread, and `LowerTileOp` silently turns that warpgroup's `T.clear`
+  and epilogue into empty loops. See `repro_two_branch_store_layout.py`.
+- **Rasterisation order is worth more than persistence.** At 16384³, same tile
+  and stages: 881.2 row-major, 1118.5 grouped, 1149.0 persistent with 16-row
+  bands.
+
 ### Order of work, revised by what the prototype found
 
-1. **Fold the package operations into the emitter.** This moved from "later
-   cleanup" to *prerequisite*: a second consumer warpgroup needs the accumulator
-   layout to come from inference, and an opaque `call_extern` gives inference
-   nothing to read (see `repro_two_branch_store_layout.py`). Everything below
-   waits on this.
-2. **Mt=256 cooperative** (`v3_coop.py`), which is otherwise designed and
-   half-validated: split M rather than N, three pipeline stages.
-3. **Shape routing.** Mt=256 wins only at 8192^3 and above -- CUTLASS measures it
-   *losing* 7.9% at 4096^3 -- so the tile has to be chosen per shape, and A3
-   lives here.
-4. **`mxf8f6f4`.**
+1. **A3: why 4096³ does not move.** The one gap that tuning did not touch, and
+   the only one where the vendor's shape curve and ours disagree in direction.
+   Needs a profiler, not another sweep.
+2. **`mxf8f6f4`.** Untouched, and the stage budget halves on that path.
+3. **Fold the package operations into the emitter.** Demoted from prerequisite
+   back to cleanup: annotation can express the second warpgroup after all, once
+   the layout is rebased. Still the right end state for upstreaming, and still
+   needs the interface agreed with the maintainer first.
+4. **Shape routing** as a kernel-selection policy rather than a benchmark
+   parameter. Mt=128 with block_K=256 wins every shape we measure once the
+   rasterisation is grouped, so this is currently cheap.
 
 ### Not goals, on evidence
 
