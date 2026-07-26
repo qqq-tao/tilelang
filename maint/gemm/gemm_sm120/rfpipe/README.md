@@ -103,7 +103,15 @@ Protocol as stated above. `pers gm=N` is persistent with N-tile-row bands.
 - **A4 met for addressing** (swizzle from the 4-line atom rule, no hand tables);
   the accumulator layout is annotated rather than inferred, which works but
   needs the thread rebase below.
-- **A5 not started.** `mxf8f6f4`.
+- **A5 not started, and it starts further back than assumed.** `gemm_sm120.h`
+  has no `mxf8f6f4` at all: `SM120MmaBlockScaledKind` has a single member
+  `kMxf4nvf4` and every path static_asserts to it. The `mxf8f6f4` hits elsewhere
+  in the tree are all tcgen05, i.e. SM100, not SM120's `mma.sync`. So A5 needs
+  new L0 work -- an `m16n8k32` block-scaled MMA with `scale_vec::1X` and ue8m0
+  scales -- before any of the scheduling layer applies. On top of that the
+  shared-memory element width becomes 1.0 bytes rather than 0.5 (fp4 and fp6 are
+  unpacked on that path), halving the stage budget, and the scale vector size
+  changes from 16 to 32.
 
 ### Constraints found the hard way
 
