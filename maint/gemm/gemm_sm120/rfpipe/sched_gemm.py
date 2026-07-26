@@ -162,6 +162,17 @@ def _m_mma(C_local, pkg, spkg):
 
 
 @T.macro
+def _m_store_panel(C_local, C_shared, C, r0, r1, c0, c1, lo, hi):
+    """One panel of the asynchronous epilogue. The wait is for the *previous*
+    store, so issuing this one does not stall the consumer."""
+    T.tma_store_wait(0, True)
+    T.copy(C_local[lo:hi, :], C_shared)
+    T.fence_proxy_async()
+    T.sync_threads(7, 128)
+    T.tma_copy(C_shared, C[r0:r1, c0:c1], leader_scope_threads=128)
+
+
+@T.macro
 def _m_wait(bars, slot, phase):
     # Index inside the macro: subscripting the barrier handle from plain Python
     # yields a Var, not the BufferLoad the builtin expects.
@@ -202,7 +213,12 @@ def _emit(op, ctx):
 @tilelang.jit(out_idx=None)
 def rf_ws_gemm(M, N, K, schedule=None, block_M=128, block_N=128, block_K=256,
                num_stages=2, out_dtype=T.bfloat16, use_emitter=False,
-               persistent=True, group_m=8, _skip_epilogue=False):
+               persistent=True, group_m=8, _skip_epilogue=False,
+               async_epilogue=False, panel_M=None):
+    # panel_M=None stages the whole tile: slicing an mma store-layout
+    # fragment by rows yields a layout the normaliser rejects.
+    if panel_M is None:
+        panel_M = block_M
     """use_emitter swaps the schedule for T.mma_gemm_blockscaled in the same
     kernel skeleton, so the two can be compared with only the inner loop
     differing. At block_K=256 the emitter routes to the package pingpong; at 128
@@ -232,6 +248,10 @@ def rf_ws_gemm(M, N, K, schedule=None, block_M=128, block_N=128, block_K=256,
     grid = sm_num if persistent else total_tiles
     tile_stride = sm_num if persistent else total_tiles
     tile_iters = ((total_tiles + sm_num - 1) // sm_num) if persistent else 1
+
+    # Precomputed outside the prim_func: the eager builder overrides range(),
+    # so range() inside the body becomes a TIR loop frame.
+    panels = list(range(block_M // panel_M))
 
     emitter = TensorCoreIntrinEmitter(
         a_dtype=in_dtype, b_dtype=in_dtype, accum_dtype=accum_dtype,
@@ -274,6 +294,11 @@ def rf_ws_gemm(M, N, K, schedule=None, block_M=128, block_N=128, block_K=256,
 
             loaded = T.alloc_barrier([128] * num_stages)
             consumed = T.alloc_barrier([128] * num_stages)
+            # Staging panel for the asynchronous store. A full 128x128 bf16 tile
+            # is 32 KB and does not fit beside the mainloop stages; panel_M rows
+            # do, and the store is issued per panel.
+            if async_epilogue:
+                C_shared = T.alloc_shared((panel_M, block_N), out_dtype)
 
             T.annotate_layout({
                 A_shared: make_swizzled_layout(A_shared),
@@ -362,7 +387,24 @@ def rf_ws_gemm(M, N, K, schedule=None, block_M=128, block_N=128, block_K=256,
                   # _skip_epilogue is a diagnostic only: it produces wrong
                   # output and bounds what any amount of epilogue hiding could
                   # be worth.
-                  if not _skip_epilogue:
+                  if _skip_epilogue:
+                      pass
+                  elif async_epilogue:
+                      # Wait for the *previous* tile's store before reusing the
+                      # panel, not after issuing this one. The last store of a
+                      # tile therefore overlaps the whole of the next tile's
+                      # k-loop instead of stalling the consumer.
+                      # Expanded at trace time: a fragment cannot be sliced at
+                      # a symbolic row offset, the layout is not provably
+                      # injective there.
+                      _ = [_m_store_panel(
+                              C_local, C_shared, C,
+                              by * block_M + pnl * panel_M,
+                              by * block_M + (pnl + 1) * panel_M,
+                              bx * block_N, (bx + 1) * block_N,
+                              pnl * panel_M, (pnl + 1) * panel_M)
+                           for pnl in panels]
+                  else:
                       T.copy(C_local,
                              C[by * block_M:(by + 1) * block_M,
                                bx * block_N:(bx + 1) * block_N])
