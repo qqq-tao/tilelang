@@ -200,7 +200,11 @@ def _emit(op, ctx):
 
 @tilelang.jit(out_idx=None)
 def rf_ws_gemm(M, N, K, schedule=None, block_M=128, block_N=128, block_K=256,
-               num_stages=2, out_dtype=T.bfloat16):
+               num_stages=2, out_dtype=T.bfloat16, use_emitter=False):
+    """use_emitter swaps the schedule for T.mma_gemm_blockscaled in the same
+    kernel skeleton, so the two can be compared with only the inner loop
+    differing. At block_K=256 the emitter routes to the package pingpong; at 128
+    it falls back to the generic path, which is what this is here to measure."""
     if schedule is None:
         schedule = pingpong_schedule(block_K // 64)
     assert M % block_M == 0 and N % block_N == 0 and K % block_K == 0
@@ -298,7 +302,24 @@ def rf_ws_gemm(M, N, K, schedule=None, block_M=128, block_N=128, block_K=256,
                         "loaded": loaded, "consumed": consumed,
                         "stage": stage, "phase": phase,
                     }
-                    _ = [_emit(op, ctx) for op in schedule]
+                    if use_emitter:
+                        T.barrier_wait(loaded[stage], phase)
+                        T.mma_gemm_blockscaled(
+                            A_shared[stage, :, :],
+                            B_shared[stage, :, :],
+                            C_local,
+                            SFA_shared[stage, :, :],
+                            SFB_shared[stage, :, :],
+                            transpose_B=True,
+                            clear_accum=False,
+                            k_start=0,
+                            sf_a_granularity_k=16,
+                            sf_b_granularity_k=16,
+                            sf_layout="blockscaled_chunk_kmajor",
+                        )
+                        T.barrier_arrive(consumed[stage])
+                    else:
+                        _ = [_emit(op, ctx) for op in schedule]
 
                 T.copy(C_local, C[by * block_M, bx * block_N])
 
