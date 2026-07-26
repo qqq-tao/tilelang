@@ -336,14 +336,28 @@ def _load_example():
     return mod
 
 
-def _make_inputs(mod, M, N, K, block_K=256):
+def _make_ue4m3_scale_words(rows, K, seed):
+    """Full-entropy scale bytes: exponents 6..8, uniform mantissa, 24 values."""
+    g = torch.Generator(device="cuda")
+    g.manual_seed(seed)
+    b = torch.randint(0x30, 0x48, (rows, K // 16), device="cuda", dtype=torch.int64, generator=g)
+    b = b.reshape(rows, -1, 4)
+    w = b[:, :, 0] | (b[:, :, 1] << 8) | (b[:, :, 2] << 16) | (b[:, :, 3] << 24)
+    return w.to(torch.uint32).contiguous()
+
+
+def _make_inputs(mod, M, N, K, block_K=256, high_entropy=False):
+    """high_entropy is the acceptance protocol; the binary scale generator makes
+    the reference exact but has two values, one of them a zero scale, so it
+    reads several percent high."""
     wpk = block_K // 64
     A = mod._make_packed_fp4(M, K, seed=71)
     B = mod._make_packed_fp4(N, K, seed=72)
+    sf = _make_ue4m3_scale_words if high_entropy else mod._make_binary_scale_words
     SFA = swizzle_blockscaled_chunk_kmajor_scale_words(
-        mod._make_binary_scale_words(M, K, seed=73), block_words=wpk).reshape(-1, wpk)
+        sf(M, K, seed=73), block_words=wpk).reshape(-1, wpk)
     SFB = swizzle_blockscaled_chunk_kmajor_scale_words(
-        mod._make_binary_scale_words(N, K, seed=74), block_words=wpk).reshape(-1, wpk)
+        sf(N, K, seed=74), block_words=wpk).reshape(-1, wpk)
     return A, B, SFA, SFB
 
 

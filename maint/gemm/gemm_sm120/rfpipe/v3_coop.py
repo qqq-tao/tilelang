@@ -180,21 +180,19 @@ def coop_gemm(M, N, K, schedule=None, block_M=256, block_N=128, block_K=128,
                         B[bx * block_N:(bx + 1) * block_N, ko * block_K:(ko + 1) * block_K],
                         B_shared[stage, :, :], barrier=loaded[stage], leader_scope_threads=128)
                     # The scale source blocks rows by 128 regardless of block_M,
-                    # so a block_M=256 tile spans two row blocks: 2*by and
-                    # 2*by+1, each a contiguous run of wpk*128 words.
-                    scale_lane = tx - 256
-                    for it in T.serial((scale_tile_words_a + 127) // 128):
-                        flat = it * 128 + scale_lane
-                        if flat < scale_tile_words_a:
-                            rb = flat // (128 * wpk)
-                            off = flat % (128 * wpk)
-                            SFA_shared[stage, flat // wpk, flat % wpk] = \
-                                SFA[((2 * by + rb) * k_blocks + ko) * 128 + off // wpk, off % wpk]
-                    for it in T.serial((scale_tile_words_b + 127) // 128):
-                        flat = it * 128 + scale_lane
-                        if flat < scale_tile_words_b:
-                            SFB_shared[stage, flat // wpk, flat % wpk] = \
-                                SFB[(bx * k_blocks + ko) * block_N + flat // wpk, flat % wpk]
+                    # so a block_M=256 tile spans two row blocks, 2*by and
+                    # 2*by+1, each a contiguous rectangle of 128 x wpk words.
+                    # A rectangular T.copy vectorises and uses the whole
+                    # producer warpgroup; the hand-strided scalar loop it
+                    # replaces cost six passes per k-tile, paid twice as often
+                    # at block_K=128, and left the two consumers starved.
+                    for rb in T.serial(2):
+                        T.copy(SFA[((2 * by + rb) * k_blocks + ko) * 128:
+                                   ((2 * by + rb) * k_blocks + ko) * 128 + 128, :],
+                               SFA_shared[stage, rb * 128:(rb + 1) * 128, :])
+                    T.copy(SFB[(bx * k_blocks + ko) * block_N:
+                               (bx * k_blocks + ko) * block_N + block_N, :],
+                           SFB_shared[stage, :, :])
                     T.barrier_arrive(loaded[stage])
             elif tx < 128:
                 C0_local = T.alloc_fragment((half_M, block_N), accum_dtype)
@@ -281,21 +279,23 @@ def main():
             print(f"    max |diff| {d.max().item()}, "
                   f"mismatch frac {(d > 0).float().mean().item():.4f}")
 
-    print("=== throughput (median of 3) ===")
-    for M, N, K in ((2048, 2048, 2048), (8192, 8192, 8192)):
+    print("=== throughput: high-entropy scales, 200 warmup, median of 3 ===")
+    for M, N, K in ((4096, 4096, 4096), (8192, 8192, 8192), (16384, 16384, 16384)):
         C = torch.empty((M, N), device="cuda", dtype=torch.bfloat16)
-        ins128 = sched_gemm._make_inputs(mod, M, N, K, 128)
-        ins256 = sched_gemm._make_inputs(mod, M, N, K, 256)
-        arms = [("Mt=128 bK=256", sched_gemm.rf_ws_gemm(M, N, K, block_K=256), ins256),
-                ("Mt=128 bK=128", sched_gemm.rf_ws_gemm(M, N, K, block_K=128), ins128)]
-        for st in (2, 3):
+        ins128 = sched_gemm._make_inputs(mod, M, N, K, 128, high_entropy=True)
+        ins256 = sched_gemm._make_inputs(mod, M, N, K, 256, high_entropy=True)
+        arms = [("Mt=128 bK=256 st=2", sched_gemm.rf_ws_gemm(M, N, K, block_K=256), ins256),
+                ("Mt=128 bK=128 st=2", sched_gemm.rf_ws_gemm(M, N, K, block_K=128), ins128),
+                ("Mt=128 bK=128 st=4",
+                 sched_gemm.rf_ws_gemm(M, N, K, block_K=128, num_stages=4), ins128)]
+        for st in (3,):
             arms.append((f"Mt=256 coop bK=128 st={st}",
                          coop_gemm(M, N, K, num_stages=st), ins128))
         for name, kern, ins in arms:
             kern(*ins, C)
             torch.cuda.synchronize()
             ms = statistics.median(
-                do_bench(lambda k=kern, i=ins: k(*i, C), _n_warmup=50, _n_repeat=200)
+                do_bench(lambda k=kern, i=ins: k(*i, C), _n_warmup=200, _n_repeat=200)
                 for _ in range(3))
             print(f"  {M}^3  {name:26s} {2.0 * M * N * K / (ms * 1e-3) / 1e12:7.1f} TFLOPS",
                   flush=True)
