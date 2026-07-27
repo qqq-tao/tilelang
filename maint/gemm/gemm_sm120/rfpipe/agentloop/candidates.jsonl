@@ -1,0 +1,8 @@
+{"type":"baseline","shape":"4096^3","config":"Mt=128 bK=256 pers gm=1","tflops":1062.2,"target":1247.7,"protocol":"high-entropy, 200 warmup, median of 3"}
+{"type":"baseline","shape":"8192^3","config":"Mt=128 bK=256 pers gm=1","tflops":1229.6,"target":1251.0,"note":"settled over 5 rounds, spread 1224.3-1230.3"}
+{"type":"baseline","shape":"16384^3","config":"Mt=128 bK=256 pers gm=16","tflops":1158.1,"target":1058.7,"note":"target met"}
+{"type":"profile","shape":"4096^3","config":"Mt=128 bK=256 pers gm=1","occupancy_pct":16.46,"regs_per_thread":218,"binding_limit":["registers","shared memory"],"warp_cycles_per_issue":12.73,"stalls":{"wait":4.83,"long_scoreboard":3.70,"sleeping":1.96,"selected":1.00},"sm_throughput_pct":64.74,"mem_throughput_pct":61.93,"finding":"latency bound at 1 CTA/SM; 67% of issue slots lost to fixed-latency dependency and memory scoreboard; neither compute nor memory saturated"}
+{"type":"revert","what":"warpgroup-level pingpong on alternating tiles","why":"still ~17% behind single consumer after the register quota fix; the prediction was epilogue hiding, the measurement did not match, and per the loop this needed a profile rather than another variation","file":"wg_pingpong.py"}
+{"type":"eliminated","claim":"4096^3 gap is wave quantisation","evidence":"persistent moved 1048.0 to 1059.5 where 6.02 waves predicted 14%"}
+{"type":"eliminated","claim":"4096^3 gap is the scale staging","evidence":"rectangular T.copy replacing the hand-strided loop moved throughput 0.2%"}
+{"type":"eliminated","claim":"emitter fold is a prerequisite for a second consumer warpgroup","evidence":"annotation works once Fragment.forward_thread is rebased by the region's thread base"}
