@@ -11,10 +11,12 @@ namespace tl {
 
 enum class SM120MmaBlockScaledKind : int {
   kMxf4nvf4 = 0,
+  kMxf8f6f4 = 1,
 };
 
 enum class SM120MmaScaleType : int {
   kUE4M3 = 0,
+  kUE8M0 = 1,
 };
 
 template <SM120MmaBlockScaledKind Kind, int ScaleVecSize,
@@ -26,6 +28,14 @@ struct SM120MmaBlockScaledConfig {
 template <>
 struct SM120MmaBlockScaledConfig<SM120MmaBlockScaledKind::kMxf4nvf4, 4,
                                  SM120MmaScaleType::kUE4M3> {
+  static constexpr bool kSupported = true;
+};
+
+// mxf8f6f4 takes scale_vec::1X and ue8m0: one scale byte per 32-element chunk,
+// against four ue4m3 bytes per 64-element chunk for mxf4nvf4.
+template <>
+struct SM120MmaBlockScaledConfig<SM120MmaBlockScaledKind::kMxf8f6f4, 1,
+                                 SM120MmaScaleType::kUE8M0> {
   static constexpr bool kSupported = true;
 };
 
@@ -132,6 +142,39 @@ TL_DEVICE void sm120_mma_m16n8k64_mxf4nvf4_4x_ue4m3_regs(
   asm volatile(
       "mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4.block_scale.scale_vec::"
       "4X.f32.e2m1.e2m1.f32.ue4m3 "
+      "{%0, %1, %2, %3}, "
+      "{%4, %5, %6, %7}, "
+      "{%8, %9}, "
+      "{%10, %11, %12, %13}, "
+      "{%14}, {%15, %16}, "
+      "{%17}, {%18, %19};\n"
+      : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
+      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "f"(c[0]),
+        "f"(c[1]), "f"(c[2]), "f"(c[3]), "r"(scale_a), "h"(scale_a_byte_id),
+        "h"(scale_a_thread_id), "r"(scale_b), "h"(scale_b_byte_id),
+        "h"(scale_b_thread_id));
+}
+
+// SM120a MXF8F6F4 block-scaled warp MMA:
+// mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32
+//
+// The operand register counts are identical to the mxf4nvf4 form above -- four
+// for A, two for B, four for the accumulator -- because a k32 chunk of 8-bit
+// operands is the same sixteen bytes per thread that a k64 chunk of packed FP4
+// is. So the ldmatrix path, the package layout and the swizzle addressing carry
+// over unchanged; what differs is the instruction, and that the scale is a
+// single ue8m0 byte per chunk rather than four ue4m3 bytes.
+//
+// The operand order in the mnemonic follows CUTLASS (kind:: first, then the
+// shape), which is the form known to assemble for this kind.
+TL_DEVICE void sm120_mma_m16n8k32_mxf8f6f4_1x_ue8m0_regs(
+    float *d, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0,
+    uint32_t b1, const float *c, uint32_t scale_a, uint32_t scale_b,
+    uint16_t scale_a_byte_id = 0, uint16_t scale_a_thread_id = 0,
+    uint16_t scale_b_byte_id = 0, uint16_t scale_b_thread_id = 0) {
+  asm volatile(
+      "mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row."
+      "col.f32.e4m3.e4m3.f32.ue8m0 "
       "{%0, %1, %2, %3}, "
       "{%4, %5, %6, %7}, "
       "{%8, %9}, "
