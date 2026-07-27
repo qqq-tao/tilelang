@@ -11,6 +11,20 @@ References: the shape of the profiling phase follows
 follows `mit-han-lab/kernel-design-agents`. Both are adapted to SM120 (RTX 5090,
 170 SMs, 99 KiB smem/CTA, 575 W hard cap) rather than B200.
 
+## Gate -1 — before writing any kernel code
+
+Read `tilelang-mechanics.md`. TileLang has a set of behaviours that are
+invisible from the API and each cost hours to find: a plain Python helper's
+`T.*` calls are silently dropped, `.data` loses the dependencies that create
+double buffering, an annotated fragment layout names absolute thread ids so a
+second warpgroup's output is silently never written, barrier subscripts must be
+taken inside a macro, `block_N` is not a free parameter, and the shared-memory
+swizzle has a shift term that is correct at `block_K=256` and wrong at 128.
+
+None of these announce themselves. They present as a missing call, a wrong
+number, or half an output tensor, and they will be re-derived from scratch by
+anyone who does not read that file first.
+
 ## Gate 0 — before any hypothesis about why something is slow
 
 Run `python agentloop/gate.py <script> <kernel-regex>`. It reports, in order:
