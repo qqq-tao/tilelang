@@ -103,6 +103,26 @@ One line each, into `candidates.jsonl` as a `contract` record:
   converge? Do the certain ones first. The motivating session spent a night on
   uncertain optimisation and never started the certain increment.
 
+## Gate 3 — is there room to finish it?
+
+Before accepting a goal, estimate the work against the budget left. A goal that
+needs hours handed to a session with minutes of context does not fail slowly and
+usefully; it produces one verified increment and then a stack of half-finished
+edits that the next session has to read before it can trust any of them.
+
+Say the estimate out loud and split the goal if it does not fit. "ISA layer,
+verified" is a goal. "ISA layer, scale packing, host scale layout, generator
+integration and a CUTLASS comparison" is five, and the last one needs a
+reference implementation built before it can even run.
+
+Symptoms that this gate was skipped: work is committed but marked UNVERIFIED;
+the ledger fills with `next` entries faster than `result` entries; the session
+ends by describing what remains rather than by finishing something.
+
+Corollary for whoever sets the goal: a goal set at the end of a long session
+inherits that session's remaining budget, not a fresh one. Setting a five-part
+goal there guarantees it fails, whatever the agent does.
+
 ## Loop
 
 ```
