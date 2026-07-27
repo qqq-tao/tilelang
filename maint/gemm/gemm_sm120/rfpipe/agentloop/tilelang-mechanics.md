@@ -4,6 +4,14 @@ Read this before writing kernel code in this area. Every entry below was found
 by debugging, cost between twenty minutes and two hours, and is invisible from
 the API surface. None of it is in TileLang's documentation.
 
+## Where the authority lives
+
+TileLang behaviour: this file, found by debugging, because it is not documented.
+
+**PTX instruction semantics: the PTX ISA document, not this file and not a
+probe.** Operand roles, block-scale selector rules, layouts and which variants
+exist are all specified. Probe to confirm you read it right, not to discover it.
+
 ## Emission: `@T.prim_func` is an AST transform, not a trace
 
 `tilelang/language/eager/ast.py: mutate()` rewrites the function's *source*

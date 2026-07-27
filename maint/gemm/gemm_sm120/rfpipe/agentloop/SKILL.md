@@ -25,6 +25,26 @@ None of these announce themselves. They present as a missing call, a wrong
 number, or half an output tensor, and they will be re-derived from scratch by
 anyone who does not read that file first.
 
+## Gate -0.5 — for instruction semantics, read the PTX ISA before measuring
+
+Anything about what a PTX instruction *means* -- operand roles, selector rules,
+layouts, which combinations exist -- is specified in the PTX ISA document, under
+"Warp Level Matrix Multiply-Accumulate Instructions" and its block-scaling
+subsection. Read that first.
+
+Measuring is a legitimate fallback and the probes in `mxf8f6f4/` are good ones,
+but a probe only tells you about the cases you probed. The spec tells you the
+rule, its edge cases, and the variants you did not think to try -- for
+`.block_scale` that is `scale_vec::1X` versus `2X` versus `4X`, which of A and B
+each selector applies to, and what happens for lanes the mapping does not name.
+The measurement that produced the mxf8f6f4 selector mapping in this repo took
+two probes and answered exactly two questions; the spec section answers those
+and about six more.
+
+Order: spec, then a probe to confirm you read it correctly, then build. Not
+probe-only. Confirming a documented rule takes one run; discovering it takes
+several, and leaves you unsure whether what you found generalises.
+
 ## Gate 0 — before any hypothesis about why something is slow
 
 Run `python agentloop/gate.py <script> <kernel-regex>`. It reports, in order:
