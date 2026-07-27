@@ -45,6 +45,17 @@ Order: spec, then a probe to confirm you read it correctly, then build. Not
 probe-only. Confirming a documented rule takes one run; discovering it takes
 several, and leaves you unsure whether what you found generalises.
 
+**Getting at it.** The section is 9.7.15.3, "Block Scaling for `mma.sync`". The
+ISA is published as one very large HTML page and a fetcher will truncate long
+before that section -- three attempts at different anchors all returned the
+front matter. Nor does this CUDA install ship a local copy
+(`/usr/local/cuda/doc/pdf/` has no PTX document). So fetch the PDF:
+
+    https://docs.nvidia.com/cuda/pdf/ptx_isa_9.3.pdf
+
+and read the section out of it. A gate that names an authority without saying
+how to reach it is not executable, which is why this paragraph is here.
+
 ## Gate 0 — before any hypothesis about why something is slow
 
 Run `python agentloop/gate.py <script> <kernel-regex>`. It reports, in order:
