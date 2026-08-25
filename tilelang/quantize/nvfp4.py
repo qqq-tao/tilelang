@@ -44,10 +44,12 @@ def _import_torch():
 
 
 def _check_block_shape(block_rows: int, block_words: int) -> None:
-    if block_rows != _BLOCKSCALED_CHUNK_ROWS or block_words != _BLOCKSCALED_CHUNK_WORDS:
+    # The chunk atom is always 128 rows; block_words follows block_K // 64 and
+    # only enters the packer as a divisibility requirement on the word count.
+    if block_rows != _BLOCKSCALED_CHUNK_ROWS or block_words not in (1, 2, 4):
         raise ValueError(
             "SM120 BlockScaledBasicChunk K-major scale packing currently supports "
-            f"block_rows={_BLOCKSCALED_CHUNK_ROWS} and block_words={_BLOCKSCALED_CHUNK_WORDS}, "
+            f"block_rows={_BLOCKSCALED_CHUNK_ROWS} and block_words in (1, 2, 4), "
             f"got block_rows={block_rows}, block_words={block_words}"
         )
 

@@ -1857,8 +1857,14 @@ class TensorCoreIntrinEmitter(_TensorCoreIntrinEmitterBase):
         sf_vec_size = self.sf_vec_size
         sf_a_granularity_k = sf_vec_size if sf_a_granularity_k is None else sf_a_granularity_k
         sf_b_granularity_k = sf_vec_size if sf_b_granularity_k is None else sf_b_granularity_k
-        scale_a_word_k = self._scale_word_k(k_start, ki, sf_a_granularity_k)
-        scale_b_word_k = self._scale_word_k(k_start, ki, sf_b_granularity_k)
+        if sf_layout == "blockscaled_chunk_kmajor":
+            # The staged scale tile covers exactly one (rows, block_K) k-tile,
+            # so the chunk word index is the local k-block id.
+            scale_a_word_k = ki
+            scale_b_word_k = ki
+        else:
+            scale_a_word_k = self._scale_word_k(k_start, ki, sf_a_granularity_k)
+            scale_b_word_k = self._scale_word_k(k_start, ki, sf_b_granularity_k)
         thread_binding = self.get_thread_binding()
         SFA_data, SFA_other, SFA_base_m, SFA_base_k = self._scale_region_parts(SFA_buf)
         SFB_data, SFB_other, SFB_base_n, SFB_base_k = self._scale_region_parts(SFB_buf)
@@ -1869,6 +1875,12 @@ class TensorCoreIntrinEmitter(_TensorCoreIntrinEmitterBase):
         def _cutlass_sf_word(idx, word_k):
             return T.call_pure_extern("int32", "tl::detail::sm120_blockscaled_chunk_kmajor_sf_word", idx, word_k)
 
+        # Words per row of the staged (rows, block_K // 64) scale tile. The
+        # chunk-kmajor flat word index is converted back to (row, word)
+        # coordinates of that tile, so the divisor must follow block_K.
+        sf_words_a = max(1, int(self.chunk) // (int(sf_a_granularity_k) * 4))
+        sf_words_b = max(1, int(self.chunk) // (int(sf_b_granularity_k) * 4))
+
         @T.macro
         def _warp_ldscale_block_scale(SFA_local_buf, SFB_local_buf, SFB_rep_local_buf, SFA_data, SFB_data, thread_binding):
             tx, warp_n, warp_m = self.extract_thread_binding(thread_binding)
@@ -1877,23 +1889,32 @@ class TensorCoreIntrinEmitter(_TensorCoreIntrinEmitterBase):
             for i in T.unroll(warp_rows):
                 scale_m = warp_m * warp_row_tiles + i * micro_size_x + sfa_row
                 if sf_layout == "blockscaled_chunk_kmajor":
-                    scale_a_word = _cutlass_sf_word(scale_m, scale_a_word_k)
-                    SFA_local_buf[i] = SFA_data[tuple(SFA_other) + (SFA_base_m + scale_a_word // 4, SFA_base_k + scale_a_word % 4)]
+                    # The chunk layout tiles rows in 128-row atoms; a >128-row
+                    # staged tile is a vertical stack of such atoms.
+                    scale_a_word = _cutlass_sf_word(scale_m % 128, scale_a_word_k)
+                    SFA_local_buf[i] = SFA_data[
+                        tuple(SFA_other)
+                        + (SFA_base_m + (scale_m // 128) * 128 + scale_a_word // sf_words_a, SFA_base_k + scale_a_word % sf_words_a)
+                    ]
                 else:
                     SFA_local_buf[i] = SFA_data[tuple(SFA_other) + (SFA_base_m + scale_m, SFA_base_k + scale_a_word_k)]
             for j in T.unroll(warp_cols):
                 scale_n = warp_n * warp_col_tiles + j * micro_size_y + sfb_col
                 if sf_layout == "blockscaled_chunk_kmajor":
-                    scale_b_word = _cutlass_sf_word(scale_n, scale_b_word_k)
-                    SFB_local_buf[j] = SFB_data[tuple(SFB_other) + (SFB_base_n + scale_b_word // 4, SFB_base_k + scale_b_word % 4)]
+                    scale_b_word = _cutlass_sf_word(scale_n % 128, scale_b_word_k)
+                    SFB_local_buf[j] = SFB_data[
+                        tuple(SFB_other)
+                        + (SFB_base_n + (scale_n // 128) * 128 + scale_b_word // sf_words_b, SFB_base_k + scale_b_word % sf_words_b)
+                    ]
                 else:
                     SFB_local_buf[j] = SFB_data[tuple(SFB_other) + (SFB_base_n + scale_n, SFB_base_k + scale_b_word_k)]
                 if replicate_b:
                     if sf_layout == "blockscaled_chunk_kmajor":
                         scale_b_rep_n = scale_n + 8
-                        scale_b_rep_word = _cutlass_sf_word(scale_b_rep_n, scale_b_word_k)
+                        scale_b_rep_word = _cutlass_sf_word(scale_b_rep_n % 128, scale_b_word_k)
                         SFB_rep_local_buf[j] = SFB_data[
-                            tuple(SFB_other) + (SFB_base_n + scale_b_rep_word // 4, SFB_base_k + scale_b_rep_word % 4)
+                            tuple(SFB_other)
+                            + (SFB_base_n + (scale_b_rep_n // 128) * 128 + scale_b_rep_word // sf_words_b, SFB_base_k + scale_b_rep_word % sf_words_b)
                         ]
                     else:
                         SFB_rep_local_buf[j] = SFB_data[tuple(SFB_other) + (SFB_base_n + scale_n + 8, SFB_base_k + scale_b_word_k)]
