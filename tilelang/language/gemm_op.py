@@ -46,6 +46,7 @@ def _gemm_dense_slots(
     clear_accum: bool,
     mbar: BarrierType | None,
     use_2cta: bool,
+    a_packed_words: bool = False,
 ) -> list:
     """Validate the A/B/C operands and build the 13 positional slots every GEMM
     tile op starts with (see the protocol documented at ``Gemm::Gemm``).
@@ -77,6 +78,10 @@ def _gemm_dense_slots(
     M, N = C_shape[-2], C_shape[-1]
     M_A = A_shape[-1] if transpose_A else A_shape[-2]
     K = A_shape[-2] if transpose_A else A_shape[-1]
+    if a_packed_words:
+        if transpose_A or str(A_region.buffer.dtype) != "uint32":
+            raise ValueError("packed-word A must be non-transposed uint32")
+        K = K * 8
     N_B = B_shape[-2] if transpose_B else B_shape[-1]
     K_B = B_shape[-1] if transpose_B else B_shape[-2]
     assert _prove_equal(M_A, M), f"{api_name} M shape check failed: M_A = {M_A}, M_C = {M}"
@@ -252,6 +257,7 @@ def _gemm_blockscaled_impl(
         clear_accum,
         mbar,
         use_2cta=bool(ann.get("use_2cta", 0)),
+        a_packed_words=bool(ann.get("a_packed_words", 0)),
     )
 
     SFA_region = to_buffer_region(_legalize_buffer_arg(SFA))

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 import tilelang.language as T
 from tilelang import tvm as tvm
+from tilelang.layout import Fragment
 from tilelang.utils.language import is_fragment
 from tvm.runtime import convert
 from tvm.tirx import Buffer, BufferRegion, PrimExpr, Var
@@ -1052,3 +1053,288 @@ class TensorCoreIntrinEmitterSM120(MMAIntrinEmitter):
             SFB_local_buf,
             SFB_rep_local_buf,
         )
+
+    def mma_packed_words(
+        self,
+        A_local_buf,
+        B_local_buf,
+        C_local_buf,
+        k_inner: PrimExpr | None = 0,
+        *,
+        SFA_buf=None,
+        SFB_buf=None,
+        k_start: PrimExpr = 0,
+        sf_a_granularity_k: int | None = None,
+        sf_b_granularity_k: int | None = None,
+        sf_layout: str = "rowmajor",
+        SFA_words=None,
+        SFB_words=None,
+        SFB_rep_words=None,
+        n_ksteps: int = 1,
+        sfb_swizzled: bool = False,
+        SFA_register_buf=None,
+    ):
+        # Keep the base-class positional signature (A, B, C, k_inner): the
+        # non-blockscaled gemm lowering calls mma(A_local, B_local, C_buf, ki).
+        if not self.is_blockscaled:
+            if SFA_buf is not None or SFB_buf is not None:
+                raise ValueError("Scale buffers require TensorCoreIntrinEmitterSM120 block-scale mode")
+            return super().mma(A_local_buf, B_local_buf, C_local_buf, k_inner)
+        if SFA_buf is None or SFB_buf is None:
+            raise ValueError("Block-scaled MMA requires SFA and SFB buffers")
+        if sf_layout != "rowmajor":
+            raise ValueError(
+                "mma() supports sf_layout='rowmajor' only; blockscaled_chunk_kmajor scales are handled by mma_blockscaled_fulltile"
+            )
+        warp_rows = self.warp_rows
+        warp_cols = self.warp_cols
+        local_size_a = self.local_size_a
+        local_size_b = self.local_size_b
+        local_size_out = self.local_size_out
+        kind = self.kind
+        scale_vec_size = self.scale_vec_size
+        stype = self.stype
+        accum_dtype = self.accum_dtype
+        a_dtype_abbrv = self.a_dtype_abbrv
+        b_dtype_abbrv = self.b_dtype_abbrv
+        mma_prefix = self.mma_prefix
+        warp_row_tiles = self.warp_row_tiles
+        warp_col_tiles = self.warp_col_tiles
+        micro_size_x = self.micro_size_x
+        micro_size_y = self.micro_size_y
+        sf_vec_size = self.sf_vec_size
+        sf_a_granularity_k = sf_vec_size if sf_a_granularity_k is None else sf_a_granularity_k
+        sf_b_granularity_k = sf_vec_size if sf_b_granularity_k is None else sf_b_granularity_k
+        scale_a_word_k = self._scale_word_k(k_start, k_inner, sf_a_granularity_k)
+        scale_b_word_k = self._scale_word_k(k_start, k_inner, sf_b_granularity_k)
+        scale_byte_id = 0
+        thread_binding = self.get_thread_binding()
+        SFA_data, SFA_other, SFA_base_m, SFA_base_k = self._scale_region_parts(SFA_buf)
+        SFB_data, SFB_other, SFB_base_n, SFB_base_k = self._scale_region_parts(SFB_buf)
+        replicate_b = self.n_dim == 16
+        # Register-A operand: the fragment holds every k atom, so step by k_inner (base-class
+        # convention); a uint32 word fragment addresses 8 packed e2m1 elements per word.
+        a_is_fragment = is_fragment(A_local_buf)
+        a_stride = k_inner * warp_rows * local_size_a if a_is_fragment else 0
+        a_elems_per_unit = 8 if str(A_local_buf.dtype) == "uint32" else 1
+        # Scale words preloaded by ldscale_words(): one word per k64 step (granularity 16), laid
+        # out [atom][k step] in registers, so the MMA reads them without further shared loads.
+        use_words = SFA_words is not None
+        SFA_register_flat = None
+        if SFA_register_buf is not None:
+            # A register fragment is a plain lane-local array after lowering; a 1-D alias over its
+            # data var lets the MMA address word ``atom * n_ksteps + k`` directly.
+            SFA_register_flat = tvm.tirx.decl_buffer(
+                (warp_rows * n_ksteps,),
+                "uint32",
+                name=f"{SFA_register_buf.name}_flat",
+                data=SFA_register_buf.data,
+                scope=SFA_register_buf.scope(),
+            )
+        if use_words and (SFB_words is None or (replicate_b and SFB_rep_words is None)):
+            raise ValueError("preloaded scale words require SFA_words, SFB_words (and SFB_rep_words for n_dim=16)")
+
+        @T.macro
+        def _warp_mma_block_scale(A_local_buf, B_local_buf, C_local_buf, SFA_data, SFB_data, thread_binding):
+            tx, warp_n, warp_m = self.extract_thread_binding(thread_binding)
+            sfa_row = self._sfa_row_in_atom(tx)
+            sfb_col = self._sfb_col_in_atom(tx)
+            for i, j in T.grid(warp_rows, warp_cols):
+                a_offset = (a_stride + i * local_size_a) // a_elems_per_unit
+                scale_m = warp_m * warp_row_tiles + i * micro_size_x + sfa_row
+                scale_n = warp_n * warp_col_tiles + j * micro_size_y + sfb_col
+                if use_words:
+                    if SFA_register_flat is not None:
+                        # scale words already in registers (see make_sfa_register_layout)
+                        scale_a_ptr = T.access_ptr(SFA_register_flat[i * n_ksteps + k_inner], "r")
+                    else:
+                        scale_a_ptr = T.access_ptr(SFA_words[i * n_ksteps + k_inner], "r")
+                    # With a swizzled B-scale layout one contiguous load per lane covers both the
+                    # atom row and its replicate, so they sit at 2j and 2j+1 of the same array.
+                    b_word = ((2 * j) * n_ksteps + k_inner) if sfb_swizzled else (j * n_ksteps + k_inner)
+                    scale_b_ptr = T.access_ptr(SFB_words[b_word], "r")
+                else:
+                    scale_a_ptr = T.access_ptr(
+                        SFA_data[tuple(SFA_other) + (SFA_base_m + scale_m, SFA_base_k + scale_a_word_k)],
+                        "r",
+                    )
+                    scale_b_ptr = T.access_ptr(
+                        SFB_data[tuple(SFB_other) + (SFB_base_n + scale_n, SFB_base_k + scale_b_word_k)],
+                        "r",
+                    )
+                T.ptx_mma_block_scale(
+                    accum_dtype,
+                    mma_prefix,
+                    "row",
+                    "col",
+                    kind,
+                    scale_vec_size,
+                    a_dtype_abbrv,
+                    b_dtype_abbrv,
+                    stype,
+                    A_local_buf.data,
+                    a_offset,
+                    B_local_buf.data,
+                    j * local_size_b,
+                    C_local_buf.data,
+                    i * warp_cols * local_size_out + j * local_size_out,
+                    scale_a_ptr,
+                    scale_b_ptr,
+                    scale_byte_id,
+                    0,
+                    scale_byte_id,
+                    0,
+                )
+                if replicate_b:
+                    if use_words:
+                        rep_word = ((2 * j + 1) * n_ksteps + k_inner) if sfb_swizzled else (j * n_ksteps + k_inner)
+                        scale_b_rep_ptr = T.access_ptr((SFB_words if sfb_swizzled else SFB_rep_words)[rep_word], "r")
+                    else:
+                        scale_b_rep_ptr = T.access_ptr(
+                            SFB_data[tuple(SFB_other) + (SFB_base_n + scale_n + 8, SFB_base_k + scale_b_word_k)],
+                            "r",
+                        )
+                    T.ptx_mma_block_scale(
+                        accum_dtype,
+                        mma_prefix,
+                        "row",
+                        "col",
+                        kind,
+                        scale_vec_size,
+                        a_dtype_abbrv,
+                        b_dtype_abbrv,
+                        stype,
+                        A_local_buf.data,
+                        a_offset,
+                        B_local_buf.data,
+                        j * local_size_b + lift(local_size_b) // 2,
+                        C_local_buf.data,
+                        i * warp_cols * local_size_out + j * local_size_out + lift(local_size_out) // 2,
+                        scale_a_ptr,
+                        scale_b_rep_ptr,
+                        scale_byte_id,
+                        0,
+                        scale_byte_id,
+                        0,
+                    )
+
+        return _warp_mma_block_scale(A_local_buf, B_local_buf, C_local_buf, SFA_data, SFB_data, thread_binding)
+
+    def make_mma_load_word_layout(self, word_buf: Buffer) -> Fragment:
+        """Layout of a uint32 fragment ``[rows, K // 8]`` holding 8 packed e2m1 elements per word in
+        the A-operand register order: word (row, w) <-> e2m1 element (row, 8 * w), index // 8."""
+        rows, words = word_buf.shape
+        elem_buf = tvm.tirx.decl_buffer((rows, words * 8), T.float4_e2m1fn, name=f"{word_buf.name}_e2m1", scope="local.fragment")
+        elem_layout = self.make_mma_load_layout(elem_buf, matrix="A")
+
+        def _scalar(x):
+            return x if isinstance(x, tvm.tirx.PrimExpr) else x[0]
+
+        def fwd_thread(i, w):
+            return _scalar(elem_layout.map_forward_thread([i, w * 8]))
+
+        def fwd_index(i, w):
+            return _scalar(elem_layout.map_forward_index([i, w * 8])) // 8
+
+        return Fragment((rows, words), forward_thread_fn=fwd_thread, forward_index_fn=fwd_index)
+
+    def make_sfa_register_layout(self, sfa_buf: Buffer, n_ksteps: int) -> Fragment:
+        """Layout of an A-operand scale-word register fragment ``[rows, K // 64]`` (4X, one word
+        per k64 step), for scales computed in registers instead of loaded from shared memory.
+
+        CUTLASS SFALayout for k64 is ((2,2,8),64) stride ((8,0,1),16): lane L issues its MMAs
+        with the scale row ``8 * (L % 2) + L // 4`` of its atom, and the two lanes of an xor-2
+        pair use the same row. Each word is therefore replicated on both lanes of the pair; the
+        local index is ``atom * n_ksteps + word`` (the ``SFA_words`` order of ``mma``).
+        The lane is taken from the A-operand layout: row ``i`` at key ``16 * rep + 8 * ((i % 16) // 8)``
+        sits on the lane with bits (i % 8, rep, (i % 16) // 8).
+        """
+        rows, words = sfa_buf.shape
+        elem_buf = tvm.tirx.decl_buffer((rows, words * 64), T.float4_e2m1fn, name=f"{sfa_buf.name}_e2m1", scope="local.fragment")
+        elem_layout = self.make_mma_load_layout(elem_buf, matrix="A")
+        warp_row_tiles = self.warp_row_tiles
+        micro_size_x = self.micro_size_x
+
+        def _scalar(x):
+            return x if isinstance(x, tvm.tirx.PrimExpr) else x[0]
+
+        def fwd_thread(i, w, rep):
+            return _scalar(elem_layout.map_forward_thread([i, w * 64 + rep * 16 + ((i % 16) // 8) * 8]))
+
+        def fwd_index(i, w):  # the replicate var only enters the thread map
+            return ((i % warp_row_tiles) // micro_size_x) * n_ksteps + w
+
+        return Fragment((rows, words), forward_thread_fn=fwd_thread, replicate=2, forward_index_fn=fwd_index)
+
+    def ldscale_words(
+        self,
+        SFA_words,
+        SFB_words,
+        SFB_rep_words,
+        SFA_buf,
+        SFB_buf,
+        n_ksteps: int,
+        k_start: PrimExpr = 0,
+        sf_a_granularity_k: int | None = None,
+        sf_b_granularity_k: int | None = None,
+        sfb_swizzled: bool = False,
+        sfa_in_registers: bool = False,
+    ):
+        """Preload the rowmajor scale words of all ``n_ksteps`` k64 steps into registers with one
+        vector load per atom row (``[atom][k step]`` order). Requires one scale word per k step,
+        i.e. granularity 16 (scale_vec::4X); see ``supports_scale_words``."""
+        warp_rows = self.warp_rows
+        warp_cols = self.warp_cols
+        warp_row_tiles = self.warp_row_tiles
+        warp_col_tiles = self.warp_col_tiles
+        micro_size_x = self.micro_size_x
+        micro_size_y = self.micro_size_y
+        sf_vec_size = self.sf_vec_size
+        sf_a_granularity_k = sf_vec_size if sf_a_granularity_k is None else sf_a_granularity_k
+        sf_b_granularity_k = sf_vec_size if sf_b_granularity_k is None else sf_b_granularity_k
+        if not self.supports_scale_words(sf_a_granularity_k, sf_b_granularity_k):
+            raise ValueError("ldscale_words requires one scale word per k step (granularity 16)")
+        rows_per_lane = (2 * warp_cols * n_ksteps) // 4
+        if sfb_swizzled and (self.n_dim != 16 or (2 * warp_cols * n_ksteps) % 4 != 0):
+            raise ValueError("swizzled B scales require replicated B and a multiple of 4 words per lane")
+        word0_a = self._scale_word_k(k_start, 0, sf_a_granularity_k)
+        word0_b = self._scale_word_k(k_start, 0, sf_b_granularity_k)
+        thread_binding = self.get_thread_binding()
+        SFA_data, SFA_other, SFA_base_m, SFA_base_k = self._scale_region_parts(SFA_buf)
+        SFB_data, SFB_other, SFB_base_n, SFB_base_k = self._scale_region_parts(SFB_buf)
+        replicate_b = self.n_dim == 16
+
+        @T.macro
+        def _warp_ldscale_words(SFA_words, SFB_words, SFB_rep_words, SFA_data, SFB_data, thread_binding):
+            tx, warp_n, warp_m = self.extract_thread_binding(thread_binding)
+            sfa_row = self._sfa_row_in_atom(tx)
+            sfb_col = self._sfb_col_in_atom(tx)
+            if not sfa_in_registers:
+                for i in T.unroll(warp_rows):
+                    scale_m = warp_m * warp_row_tiles + i * micro_size_x + sfa_row
+                    for v in T.vectorized(n_ksteps):
+                        SFA_words[i * n_ksteps + v] = SFA_data[tuple(SFA_other) + (SFA_base_m + scale_m, SFA_base_k + word0_a + v)]
+            if sfb_swizzled:
+                # The B scales are stored with their rows permuted (row n at position
+                # (n % 8) * 16 + n // 8), reshaped to 4 words per row, and each lane's block of
+                # rows padded by one row: contiguous rows per lane, and the pad keeps the eight
+                # lane blocks off the same banks (a bare 128-byte stride puts them all on four).
+                for g in T.unroll(rows_per_lane):
+                    for v in T.vectorized(4):
+                        SFB_words[g * 4 + v] = SFB_data[tuple(SFB_other) + (SFB_base_n + sfb_col * (rows_per_lane + 1) + g, SFB_base_k + v)]
+            else:
+                for j in T.unroll(warp_cols):
+                    scale_n = warp_n * warp_col_tiles + j * micro_size_y + sfb_col
+                    for v in T.vectorized(n_ksteps):
+                        SFB_words[j * n_ksteps + v] = SFB_data[tuple(SFB_other) + (SFB_base_n + scale_n, SFB_base_k + word0_b + v)]
+                    if replicate_b:
+                        for v in T.vectorized(n_ksteps):
+                            SFB_rep_words[j * n_ksteps + v] = SFB_data[
+                                tuple(SFB_other) + (SFB_base_n + scale_n + 8, SFB_base_k + word0_b + v)
+                            ]
+
+        return _warp_ldscale_words(SFA_words, SFB_words, SFB_rep_words, SFA_data, SFB_data, thread_binding)
+
+    def supports_scale_words(self, sf_a_granularity_k: int, sf_b_granularity_k: int) -> bool:
+        """One rowmajor scale word (4 bytes) per k64 MMA step for both operands."""
+        return int(sf_a_granularity_k) * 4 == int(self.micro_size_k) and int(sf_b_granularity_k) * 4 == int(self.micro_size_k)

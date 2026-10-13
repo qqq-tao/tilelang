@@ -410,6 +410,8 @@ def mma_gemm_blockscaled(
     sf_a_granularity_k: int,
     sf_b_granularity_k: int,
     sf_layout: str | None = None,
+    a_packed_words: bool = False,
+    sf_b_swizzled: bool = False,
 ) -> tirx.PrimExpr:
     """Explicit SM120 warp-level block-scaled MMA GEMM.
 
@@ -423,9 +425,24 @@ def mma_gemm_blockscaled(
     The current supported instruction is SM120 NVF4:
     ``m16n8k64.kind::mxf4nvf4.block_scale.scale_vec::4X`` with E2M1 operands,
     FP32 accumulation, and UE4M3 scale factors.
+
+    ``a_packed_words=True`` accepts a full uint32 register fragment of shape
+    ``[M, K // 8]``, with eight packed E2M1 values per word. A must be
+    non-transposed; B remains shared packed E2M1. Scales use granularity 16.
+    SFA may be a full uint32 fragment of shape ``[M, K // 64]`` with ``k_start=0``.
+
+    ``sf_b_swizzled=True`` is an SM120 packed-word-path storage contract:
+    B scale rows are permuted into per-lane groups, four words per row,
+    with one padding row per lane group. Requires ``k_start=0`` and a FullRow
+    warp partition. See the SageAttention3 exporter.
+    Default row-major scale behavior is unchanged.
     """
 
     ann: dict = {}
+    if a_packed_words:
+        ann["a_packed_words"] = 1
+    if sf_b_swizzled:
+        ann["sf_b_swizzled"] = 1
     if sf_layout is not None:
         ann["sf_layout"] = sf_layout
     return _gemm_blockscaled_impl(
